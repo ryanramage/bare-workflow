@@ -1,0 +1,8 @@
+node_modules
+package-lock.json
+coverage
+.bw-state
+
+# Build artifacts: the agent binary is 84 MB and is rebuilt by scripts/build/agent.js.
+out
+tmp

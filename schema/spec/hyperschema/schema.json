@@ -1,0 +1,180 @@
+{
+  "version": 1,
+  "schema": [
+    {
+      "name": "hello-request",
+      "namespace": "bw",
+      "compact": false,
+      "flagsPosition": -1,
+      "fields": [
+        {
+          "name": "driver",
+          "required": true,
+          "type": "string",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "hello-response",
+      "namespace": "bw",
+      "compact": false,
+      "flagsPosition": 4,
+      "fields": [
+        {
+          "name": "agent",
+          "required": true,
+          "type": "string",
+          "version": 1
+        },
+        {
+          "name": "platform",
+          "required": true,
+          "type": "string",
+          "version": 1
+        },
+        {
+          "name": "arch",
+          "required": true,
+          "type": "string",
+          "version": 1
+        },
+        {
+          "name": "pid",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "strayFds",
+          "array": true,
+          "type": "string",
+          "version": 1
+        },
+        {
+          "name": "cwd",
+          "required": true,
+          "type": "string",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "ping-request",
+      "namespace": "bw",
+      "compact": false,
+      "flagsPosition": -1,
+      "fields": [
+        {
+          "name": "nonce",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "ping-response",
+      "namespace": "bw",
+      "compact": false,
+      "flagsPosition": -1,
+      "fields": [
+        {
+          "name": "nonce",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "exec-request",
+      "namespace": "bw",
+      "compact": false,
+      "flagsPosition": 1,
+      "fields": [
+        {
+          "name": "kind",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "run",
+          "type": "string",
+          "version": 1
+        },
+        {
+          "name": "shell",
+          "type": "string",
+          "version": 1
+        },
+        {
+          "name": "cwd",
+          "type": "string",
+          "version": 1
+        },
+        {
+          "name": "env",
+          "array": true,
+          "type": "string",
+          "version": 1
+        },
+        {
+          "name": "timeoutMs",
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "chunk",
+          "type": "buffer",
+          "version": 1
+        },
+        {
+          "name": "signal",
+          "type": "string",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "exec-response",
+      "namespace": "bw",
+      "compact": false,
+      "flagsPosition": 1,
+      "fields": [
+        {
+          "name": "kind",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "chunk",
+          "type": "buffer",
+          "version": 1
+        },
+        {
+          "name": "code",
+          "type": "int",
+          "version": 1
+        },
+        {
+          "name": "signal",
+          "type": "string",
+          "version": 1
+        },
+        {
+          "name": "message",
+          "type": "string",
+          "version": 1
+        },
+        {
+          "name": "timedOut",
+          "type": "bool",
+          "version": 1
+        }
+      ]
+    }
+  ]
+}

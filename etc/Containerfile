@@ -1,0 +1,30 @@
+# Sandbox base image.
+#
+# Deliberately minimal: a base OS, the agent, and the directories the workspace mounts land on.
+# No build toolchain here -- toolchain images layer on top of this one, so the agent and the
+# isolation posture stay identical across all of them.
+#
+# The agent is COPYed in, not mounted. Rootless idmapped bind mounts are kernel-forbidden
+# (podman-run(1): "The Linux kernel does not allow the use of idmapped file systems for
+# unprivileged users"), we refuse host mounts on principle, and a krun microVM cannot be
+# `podman exec`'d to inject anything after the fact. Baking it in is the only option -- and it
+# means the agent's bytes are covered by the image digest that goes into each job's attestation.
+FROM docker.io/library/ubuntu:24.04
+
+# bash for step execution, ca-certificates so a `fetch:` step can talk to the allowlisting proxy
+# later. Nothing else: every added package is attack surface inside the sandbox.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends bash ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# ubuntu:24.04 already ships a uid-1000 `ubuntu` user, which is what --user 1000:1000 selects.
+# Create the mount points and hand them to that uid: the tmpfs mounts arrive empty and owned by
+# root, so the agent recreates its subtree at startup, but the roots must exist first.
+RUN mkdir -p /w /cache /opt/bw \
+ && chown 1000:1000 /w /cache
+
+COPY out/agent/bw-agent /opt/bw/agent
+RUN chmod 0755 /opt/bw/agent
+
+# Not an ENTRYPOINT: the argv builder passes --entrypoint explicitly so the running command is
+# visible in the attestation rather than implied by the image.

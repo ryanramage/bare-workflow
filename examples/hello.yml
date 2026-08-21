@@ -1,0 +1,10 @@
+# The smallest thing that proves the stack works end to end.
+#
+# Top-level `steps:` is sugar for a single job named `main`. Six lines has to stay six lines --
+# that is the whole pitch versus a GitHub Actions file.
+version: 1
+name: hello
+
+steps:
+  - echo "hello from inside the sandbox"
+  - uname -r

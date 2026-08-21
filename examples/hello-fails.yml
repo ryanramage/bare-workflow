@@ -1,0 +1,8 @@
+# Proves failure propagates: a non-zero step fails the job and the CLI exits non-zero.
+version: 1
+name: hello-fails
+
+steps:
+  - echo "this one is fine"
+  - run: exit 3
+  - echo "this must never run"

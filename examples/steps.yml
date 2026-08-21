@@ -1,0 +1,30 @@
+# Exercises the step mapping form: env precedence, per-step timeout, continue-on-error, and a
+# multi-line script.
+version: 1
+name: steps
+targets: [host]
+
+env:
+  WORKFLOW_LEVEL: workflow
+
+jobs:
+  demo:
+    env:
+      JOB_LEVEL: job
+    steps:
+      - name: env precedence
+        run: |
+          echo "workflow=$WORKFLOW_LEVEL job=$JOB_LEVEL step=$STEP_LEVEL"
+        env:
+          STEP_LEVEL: step
+
+      - name: a soft failure does not stop the job
+        run: exit 9
+        continue-on-error: true
+
+      - name: still running after that
+        run: echo "carried on"
+
+      - name: bounded by a timeout
+        run: echo quick
+        timeout: 30s

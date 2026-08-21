@@ -1,0 +1,74 @@
+{
+  "name": "bare-workflow",
+  "version": "0.0.0",
+  "description": "A P2P build farm for Holepunch, running sandboxed workflows on Bare",
+  "main": "index.js",
+  "exports": {
+    "./package": "./package.json",
+    ".": "./index.js",
+    "./errors": "./lib/errors.js",
+    "./sandbox": "./lib/sandbox.js",
+    "./protocol": "./lib/protocol.js",
+    "./agent": "./lib/agent/index.js",
+    "./isolation/podman/argv": "./lib/isolation/podman/argv.js",
+    "./isolation/podman/seccomp": "./lib/isolation/podman/seccomp.js",
+    "./isolation/podman/launcher": "./lib/isolation/podman/launcher.js"
+  },
+  "files": [
+    "package.json",
+    "index.js",
+    "lib",
+    "schema/spec",
+    "schema/builder",
+    "etc",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "imports": {
+    "fs": {
+      "bare": "bare-fs",
+      "default": "fs"
+    },
+    "path": {
+      "bare": "bare-path",
+      "default": "path"
+    },
+    "events": {
+      "bare": "bare-events",
+      "default": "events"
+    },
+    "subprocess": {
+      "bare": "bare-subprocess",
+      "default": "child_process"
+    }
+  },
+  "scripts": {
+    "build:rpc": "bare scripts/build/rpc.js && prettier --write schema/spec",
+    "format": "prettier --write . && lunte --fix lib test schema/builder scripts",
+    "lint": "prettier --check . && lunte lib test schema/builder scripts",
+    "test": "brittle-bare test/index.js"
+  },
+  "author": "Holepunch",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "bare-crypto": "^1.15.3",
+    "bare-env": "^3.0.1",
+    "bare-events": "^2.9.1",
+    "bare-fs": "^4.8.0",
+    "bare-path": "^3.1.1",
+    "bare-pipe": "^4.2.3",
+    "bare-stream": "^2.13.3",
+    "bare-subprocess": "^6.1.0",
+    "hrpc": "^4.3.0",
+    "js-yaml": "^5.3.0",
+    "paparam": "^1.13.0"
+  },
+  "devDependencies": {
+    "brittle": "^4.1.0",
+    "hyperschema": "^1.22.0",
+    "lunte": "^1.8.4",
+    "prettier": "^3.9.6",
+    "prettier-config-holepunch": "^2.0.0"
+  }
+}

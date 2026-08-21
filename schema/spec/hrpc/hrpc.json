@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "schema": [
+    {
+      "id": 0,
+      "name": "@bw/hello",
+      "request": {
+        "name": "@bw/hello-request",
+        "stream": false
+      },
+      "response": {
+        "name": "@bw/hello-response",
+        "stream": false
+      },
+      "version": 1
+    },
+    {
+      "id": 1,
+      "name": "@bw/ping",
+      "request": {
+        "name": "@bw/ping-request",
+        "stream": false
+      },
+      "response": {
+        "name": "@bw/ping-response",
+        "stream": false
+      },
+      "version": 1
+    },
+    {
+      "id": 2,
+      "name": "@bw/exec",
+      "request": {
+        "name": "@bw/exec-request",
+        "stream": true
+      },
+      "response": {
+        "name": "@bw/exec-response",
+        "stream": true
+      },
+      "version": 1
+    }
+  ]
+}
