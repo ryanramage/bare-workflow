@@ -1,0 +1,11 @@
+{
+  "name": "bw-offline-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "safe-buffer": "5.2.1"
+  },
+  "scripts": {
+    "test": "node -e \"const b=require('safe-buffer').Buffer; if(b.from('ok').toString()!=='ok') process.exit(1); console.log('dependency works offline')\""
+  }
+}

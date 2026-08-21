@@ -1,0 +1,12 @@
+# Node toolchain image, layered ON TOP of the base.
+#
+# The agent and the isolation posture live in the base, so every toolchain image inherits exactly
+# the same sandbox behaviour -- a toolchain cannot accidentally weaken it, and there is one place to
+# audit. This is what `toolchain:` in a workflow will select once it is wired up.
+ARG BASE=localhost/bare-workflow-base:dev
+FROM ${BASE}
+
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends nodejs npm \
+ && rm -rf /var/lib/apt/lists/*

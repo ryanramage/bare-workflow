@@ -29,4 +29,19 @@ module.exports = function generateRPC(hrpc) {
     request: { name: '@bw/exec-request', stream: true },
     response: { name: '@bw/exec-response', stream: true }
   })
+
+  // Transfer. Appended rather than reserved up front, which is exactly what hrpc's append-only
+  // guarantee is for: an agent baked into an older image simply does not answer these, instead of
+  // silently disagreeing about what they mean.
+  ns.register({
+    name: 'put',
+    request: { name: '@bw/put-request', stream: true },
+    response: { name: '@bw/put-response', stream: false }
+  })
+
+  ns.register({
+    name: 'get',
+    request: { name: '@bw/get-request', stream: false },
+    response: { name: '@bw/get-response', stream: true }
+  })
 }

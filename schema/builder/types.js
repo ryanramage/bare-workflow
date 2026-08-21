@@ -46,7 +46,15 @@ module.exports = function generateTypes(schema) {
       // non-empty list means a descriptor leaked in and the driver aborts the job rather than
       // running a workload next to an inherited handle.
       { name: 'strayFds', type: 'string', array: true },
-      { name: 'cwd', type: 'string', required: true }
+      { name: 'cwd', type: 'string', required: true },
+      // Which commands this agent actually implements.
+      //
+      // hrpc's append-only guarantee protects the ENCODING -- it does not stop a driver calling a
+      // command that an older agent has no handler for, and the failure is not graceful: the agent
+      // dies with "this._handlers[command] is not a function" and the driver sees only a crashed
+      // container. In a farm where peers run different image versions, that is a routine situation,
+      // so agents advertise their surface and the driver checks before it calls.
+      { name: 'commands', type: 'string', array: true }
     ]
   })
 
@@ -90,10 +98,82 @@ module.exports = function generateTypes(schema) {
       { name: 'message', type: 'string' },
       // Set on EXIT when the agent stopped the step itself, so the driver can distinguish
       // "the build failed" from "we killed it".
-      { name: 'timedOut', type: 'bool' }
+      { name: 'timedOut', type: 'bool' },
+      // Raw contents of the step's output file, shipped verbatim on EXIT.
+      //
+      // The agent does NOT parse it. This content is attacker-controlled -- a build can write
+      // whatever it likes -- so it is parsed once, on the trusted side, by the shared parser in
+      // lib/protocol.js. One tested parser beats two, and the driver is where outputs get used.
+      { name: 'outputsRaw', type: 'string' },
+      // True when the agent stopped reading because the file exceeded its cap.
+      { name: 'outputsTruncated', type: 'bool' }
+    ]
+  })
+
+  // --- file transfer -----------------------------------------------------------------
+  //
+  // Data crosses the boundary as a TAR STREAM, not a shared mount. Rootless idmapped bind mounts
+  // are kernel-forbidden, and refusing host mounts altogether removes the whole bind-mount attack
+  // surface plus the host-path-rebasing problem that comes with it. The cost is copying bytes; the
+  // benefit is that no host path ever exists inside the sandbox.
+
+  ns.register({
+    name: 'put-request',
+    fields: [
+      { name: 'kind', type: 'uint', required: true },
+      // START
+      { name: 'path', type: 'string' },
+      // CHUNK: raw tar bytes
+      { name: 'chunk', type: 'buffer' }
+    ]
+  })
+
+  ns.register({
+    name: 'put-response',
+    fields: [
+      { name: 'ok', type: 'bool' },
+      { name: 'files', type: 'uint' },
+      { name: 'bytes', type: 'uint' },
+      { name: 'message', type: 'string' }
+    ]
+  })
+
+  ns.register({
+    name: 'get-request',
+    fields: [
+      { name: 'path', type: 'string', required: true },
+      // Glob patterns relative to `path`; empty means everything under it.
+      { name: 'globs', type: 'string', array: true }
+    ]
+  })
+
+  ns.register({
+    name: 'get-response',
+    fields: [
+      { name: 'kind', type: 'uint', required: true },
+      { name: 'chunk', type: 'buffer' },
+      { name: 'message', type: 'string' },
+      { name: 'files', type: 'uint' },
+      { name: 'bytes', type: 'uint' }
     ]
   })
 }
 
+// Frame kinds on the put request stream (driver -> agent).
+const PUT_IN = {
+  START: 0, // begin an extraction at `path`
+  CHUNK: 1, // raw tar bytes
+  END: 2 // no more bytes
+}
+
+// Frame kinds on the get response stream (agent -> driver).
+const GET_OUT = {
+  CHUNK: 0, // raw tar bytes
+  DONE: 1, // terminal: carries counts
+  ERROR: 2 // terminal
+}
+
+module.exports.PUT_IN = PUT_IN
+module.exports.GET_OUT = GET_OUT
 module.exports.EXEC_IN = EXEC_IN
 module.exports.EXEC_OUT = EXEC_OUT

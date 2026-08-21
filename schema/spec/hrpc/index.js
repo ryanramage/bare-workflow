@@ -11,7 +11,11 @@ const methods = new Map([
   ['@bw/ping', 1],
   [1, '@bw/ping'],
   ['@bw/exec', 2],
-  [2, '@bw/exec']
+  [2, '@bw/exec'],
+  ['@bw/put', 3],
+  [3, '@bw/put'],
+  ['@bw/get', 4],
+  [4, '@bw/get']
 ])
 
 class HRPC {
@@ -21,12 +25,16 @@ class HRPC {
     this._requestEncodings = new Map([
       ['@bw/hello', getEncoding('@bw/hello-request')],
       ['@bw/ping', getEncoding('@bw/ping-request')],
-      ['@bw/exec', getEncoding('@bw/exec-request')]
+      ['@bw/exec', getEncoding('@bw/exec-request')],
+      ['@bw/put', getEncoding('@bw/put-request')],
+      ['@bw/get', getEncoding('@bw/get-request')]
     ])
     this._responseEncodings = new Map([
       ['@bw/hello', getEncoding('@bw/hello-response')],
       ['@bw/ping', getEncoding('@bw/ping-response')],
-      ['@bw/exec', getEncoding('@bw/exec-response')]
+      ['@bw/exec', getEncoding('@bw/exec-response')],
+      ['@bw/put', getEncoding('@bw/put-response')],
+      ['@bw/get', getEncoding('@bw/get-response')]
     ])
     this._rpc = new RPC(stream, async (req) => {
       const command = methods.get(req.command)
@@ -136,6 +144,14 @@ class HRPC {
     return this._callSync('@bw/exec', args)
   }
 
+  put(args) {
+    return this._callSync('@bw/put', args)
+  }
+
+  get(args) {
+    return this._callSync('@bw/get', args)
+  }
+
   onHello(responseFn) {
     this._handlers['@bw/hello'] = responseFn
   }
@@ -148,12 +164,20 @@ class HRPC {
     this._handlers['@bw/exec'] = responseFn
   }
 
+  onPut(responseFn) {
+    this._handlers['@bw/put'] = responseFn
+  }
+
+  onGet(responseFn) {
+    this._handlers['@bw/get'] = responseFn
+  }
+
   _requestIsStream(command) {
-    return ['@bw/exec'].includes(command)
+    return ['@bw/exec', '@bw/put'].includes(command)
   }
 
   _responseIsStream(command) {
-    return ['@bw/exec'].includes(command)
+    return ['@bw/exec', '@bw/get'].includes(command)
   }
 
   // prettier-ignore-start

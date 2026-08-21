@@ -1,0 +1,36 @@
+# The acid test for `network: none`: a real `npm ci` with no network at all.
+#
+# The runner prefetches from the committed lockfile on the HOST before any sandbox exists, verifying
+# every tarball against its recorded hash. Inside, npm installs from that cache offline, with
+# --ignore-scripts so no package code runs at install time (which is already the org's house style
+# in actions/node-base).
+version: 1
+name: offline
+source: ./project
+
+# Which sandbox image to run in. The base image carries the agent and nothing else, so a workflow
+# that needs npm has to say so -- otherwise every sandbox would ship a toolchain it does not use.
+toolchain: node
+
+jobs:
+  test:
+    targets: [host]
+    prefetch: [npm]
+    steps:
+      - name: install from the prefetched cache, offline
+        run: npm ci --offline --ignore-scripts --cache /w/cache
+
+      - name: prove there is genuinely no network
+        # Reading the kernel's routing table rather than attempting a connection: with no route
+        # there is nothing to time out against, and `npm ping` sits for 70+ seconds before
+        # admitting defeat.
+        run: |
+          routes=$(awk 'NR>1 && $2=="00000000" {n++} END {print n+0}' /proc/net/route)
+          if [ "$routes" != "0" ]; then
+            echo "UNEXPECTED: the sandbox has a default route"
+            exit 1
+          fi
+          echo "confirmed: no default route, no egress"
+
+      - name: run the project's tests
+        run: npm test

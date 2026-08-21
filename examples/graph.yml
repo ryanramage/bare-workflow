@@ -1,0 +1,29 @@
+# The M2 acceptance case: two jobs, one needing the other, passing an output between them.
+version: 1
+name: graph
+targets: [host]
+
+jobs:
+  version:
+    outputs:
+      value: '{{ steps.read.outputs.version }}'
+    steps:
+      - name: read the version
+        id: read
+        run: echo "version=1.2.3" >> $BW_OUTPUT
+
+  package:
+    needs: version
+    steps:
+      - name: use the upstream output
+        run: echo "packaging {{ needs.version.outputs.value }}"
+
+  notify:
+    needs: package
+    steps:
+      - name: only on success
+        run: echo "all good"
+        if: success()
+      - name: only on failure
+        run: echo "should not print"
+        if: failure()

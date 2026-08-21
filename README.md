@@ -4,19 +4,20 @@ A P2P build farm for Holepunch, running sandboxed workflows on [Bare](https://gi
 
 > [!NOTE]
 > This is an experimental library, and early. A version 1.0.0 release will signal stability.
-> Today it parses a workflow and runs one job's steps inside a microVM. The job DAG, matrix
-> expansion, artifacts, and the P2P farm are not built yet.
+> Today it runs a dependency graph of jobs across targets in microVMs, moves artifacts between them,
+> and installs npm dependencies with **no network at all**. Free-form matrix axes, signing, and the
+> P2P farm are not built yet.
 
 ```console
 $ bare-workflow run examples/hello.yml
-◉ hello  tier=microvm  image=bare-workflow-base:dev
-  ◉ echo "hello from inside the sandbox"
+◉ hello  tier=microvm  1 task
+  ◉ main:host :: echo "hello from inside the sandbox"
     hello from inside the sandbox
-  ✔ echo "hello from inside the sandbox"  32ms
-  ◉ uname -r
+  ✔ main:host :: echo "hello from inside the sandbox"  36ms
+  ◉ main:host :: uname -r
     6.12.91
-  ✔ uname -r  34ms
-  ✔ job main: success
+  ✔ main:host :: uname -r  31ms
+  ✔ main:host: success
 ```
 
 That `6.12.91` is the guest kernel, not the host's — the step really ran inside the VM.
@@ -29,7 +30,8 @@ That `6.12.91` is the guest kernel, not the host's — the step really ran insid
 so a farm of heterogeneous _real_ peers is the answer, and every job has to be safe to run on
 someone else's machine.
 
-That last part is the hard part, and it is what exists so far.
+That last part is the hard part, and it is where most of the work has gone: the isolation layer came
+first, and the workflow engine is being built on top of it rather than the other way round.
 
 ## The workflow
 
@@ -60,6 +62,91 @@ $ bare-workflow validate broken.yml
 
 Error quality is a feature here, not politeness. Unknown keys, unresolvable `needs`, malformed
 durations and duplicate step ids are all rejected with a path, a line, and a suggestion.
+
+### Interpolation
+
+`{{ }}` over a closed set of roots — `target`, `matrix`, `env`, `needs`, `steps`, `job`, `run` — with
+no functions and no arithmetic. **An unknown reference is a hard error, never an empty string**:
+
+```
+✖ EXPR_UNKNOWN_REFERENCE: unknown reference "needs.version.outputs.nope"; available: value
+```
+
+That single decision removes most of the mystery from a failing workflow. GHA substitutes `''` and
+lets the build carry on doing the wrong thing indefinitely.
+
+`if:` takes a small predicate grammar — `success()` / `failure()` / `always()` / `cancelled()`, `==`,
+`!=`, `in [...]`, `and` / `or` / `not`, parentheses — with paths written bare:
+
+```yaml
+- run: ./upload
+  if: success() and target.platform != 'win32'
+```
+
+> [!TIP]
+> `{{` starts a YAML flow mapping, so an interpolation inside a **flow** sequence is a syntax error:
+> `steps: [echo '{{ x }}']` will not parse. Use block style, which is what you want for anything
+> non-trivial anyway.
+
+### Jobs, targets and data flow
+
+`needs` orders jobs; a job with several targets becomes several tasks, and a dependency waits for all
+of them. Outputs are declared, written to a **file** (`$BW_OUTPUT`), and parsed on the trusted side:
+
+```yaml
+jobs:
+  version:
+    outputs:
+      value: '{{ steps.read.outputs.version }}'
+    steps:
+      - id: read
+        run: echo "version=1.2.3" >> $BW_OUTPUT
+
+  package:
+    needs: version
+    steps:
+      - run: echo "packaging {{ needs.version.outputs.value }}"
+```
+
+A file rather than GHA's `::set-output::` stdout scraping, because in a farm log lines are
+attacker-controlled by construction — a build could otherwise forge any output it liked. A file
+descriptor is a capability; stdout is a broadcast.
+
+Reading `needs.<job>.outputs.*` from a job that ran for **several** targets is refused rather than
+guessed at, because there is genuinely more than one value:
+
+```
+✖ needs.multi.outputs.value is ambiguous: multi ran for 2 targets (linux-arm64, linux-x64).
+  Give multi a single target, or read it per target.
+```
+
+### Toolchains
+
+`toolchain:` selects the sandbox image, and it is what replaces GHA's `uses:` entirely — a curated,
+versioned set rather than fetching third-party code into the runner. Every toolchain image layers on
+the **same base**, so the agent and the isolation posture are identical across all of them: a
+toolchain cannot weaken the sandbox, and there is one place to audit.
+
+```yaml
+version: 1
+toolchain: node # or per job
+steps:
+  - npm ci --offline --ignore-scripts --cache /w/cache
+```
+
+The default is `bare`: the base image carries the agent and nothing else, so a workflow that needs
+npm has to say so rather than every sandbox shipping tooling it does not use. A typo is caught at
+parse time, and a toolchain whose image has not been built is refused **before anything runs**:
+
+```console
+$ bare-workflow run examples/offline.yml
+✖ required sandbox image not built:
+  toolchain node: localhost/bare-workflow-node:dev
+    build it: podman build -f etc/Containerfile.node -t localhost/bare-workflow-node:dev .
+```
+
+`bare-workflow doctor` lists every toolchain and whether it is built. `--image` overrides the lot,
+for trying an image that has no registry entry yet.
 
 ## Isolation
 
@@ -127,12 +214,95 @@ await box.dispose()
 `prepare` / `exec` / `dispose` is the shape, so a ten-step job pays setup once instead of ten
 times. Output streams as it happens with byte caps, rather than being collected after exit.
 
+### Getting data in and out
+
+There are no host mounts — rootless idmapped bind mounts are kernel-forbidden, and refusing them
+outright removes the whole bind-mount attack surface along with the host-path-rebasing problem that
+comes with it. So everything crosses as a **validated tar stream**, and `lib/transfer.js` decides
+entry by entry what is allowed to exist:
+
+regular files and directories only (no symlinks, hardlinks, fifos or devices) · no absolute paths ·
+no `..` in any component · no control characters in names · depth, length, entry-count and byte caps ·
+modes masked so a setuid bit cannot survive · case-insensitive collision detection · Windows-reserved
+names rejected · extraction only into a fresh empty directory.
+
+Symlinks are _skipped_ on the way out rather than followed, so a build cannot plant one to smuggle
+out anything the sandbox merely had access to.
+
+Artifacts are declared on both sides, and the name is interpolated so a fan-out job produces one
+artifact per target instead of several tasks fighting over a single name:
+
+```yaml
+jobs:
+  build:
+    targets: [linux-x64, linux-arm64]
+    artifacts:
+      out:
+        - name: app-{{ target }}
+          path: out/**
+          if-no-files-found: error
+
+  assemble:
+    needs: build
+    artifacts:
+      in:
+        - name: app-linux-x64
+          to: ./stage/linux-x64
+```
+
+The store is written against a **drive**, not a path. `localdrive` and `hyperdrive` share a surface,
+so v1 passes a Localdrive and the farm later passes a Hyperdrive — at which point returning an
+artifact from a peer is `drive.mirror()`, and `pear stage` / `seed` / `dump` already speak the format.
+
+### Dependencies with no network
+
+`network: none` is only honest if a real build can still install its dependencies. The runner
+prefetches on the **host**, before any sandbox exists:
+
+```yaml
+version: 1
+source: ./project
+
+jobs:
+  test:
+    prefetch: [npm]
+    steps:
+      - run: npm ci --offline --ignore-scripts --cache /w/cache
+      - run: npm test
+```
+
+```console
+$ bare-workflow run examples/offline.yml --image localhost/bare-workflow-node:dev
+◉ prefetching 1 package from the lockfile
+  ✔ 1 fetched, 0 already cached
+  ↓ test:host :: source  2 files
+  ↓ test:host :: cache  1 files
+  ✔ test:host :: install from the prefetched cache, offline  2.2s
+    confirmed: no default route, no egress
+  ✔ test:host :: run the project's tests  2.3s
+```
+
+Three properties, and the first two are the whole point:
+
+- **It resolves nothing.** Every URL and hash comes from the committed lockfile. No registry
+  metadata request, no version resolution, no dependency solving — if it is not in
+  `package-lock.json` it is not fetched.
+- **It executes no package code.** Nothing is unpacked and no lifecycle script runs; tarballs are
+  downloaded and verified, full stop. That is also why the install uses `--ignore-scripts`, which is
+  already the house style in `actions/node-base`.
+- **Every tarball is verified** against the lockfile's `integrity` before it is kept. A registry
+  serving different bytes than the repository recorded is a supply-chain event, not a retry.
+
+A lockfile pointing at an unexpected host, or missing an integrity hash, is refused before anything
+is fetched.
+
 ## CLI
 
 ```
-bare-workflow validate <file>   # parse and report; exit 1 on a bad workflow
-bare-workflow run <file>        # run it in the strongest available sandbox
-bare-workflow doctor            # what tiers and targets this host supports
+bare-workflow validate <file>       # parse and report; exit 1 on a bad workflow
+bare-workflow run <file>            # run it in the strongest available sandbox
+bare-workflow doctor                # what tiers and targets this host supports
+bare-workflow artifacts <run-id>    # list, or --get <name> to extract
 ```
 
 `run` takes `--job <name>`, `--tier <microvm|container>`, `--image <ref>`, `--env KEY=VALUE`
@@ -150,6 +320,7 @@ npm install
 
 npm run build:rpc          # regenerate schema/spec from schema/builder (committed output)
 bare scripts/build/agent.js  # build the agent binary + the sandbox base image
+podman build -f etc/Containerfile.node -t localhost/bare-workflow-node:dev .  # a node toolchain on top
 
 npm test
 npm run lint

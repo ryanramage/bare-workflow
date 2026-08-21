@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 4,
   "schema": [
     {
       "name": "hello-request",
@@ -56,6 +56,12 @@
           "required": true,
           "type": "string",
           "version": 1
+        },
+        {
+          "name": "commands",
+          "array": true,
+          "type": "string",
+          "version": 4
         }
       ]
     },
@@ -173,6 +179,122 @@
           "name": "timedOut",
           "type": "bool",
           "version": 1
+        },
+        {
+          "name": "outputsRaw",
+          "type": "string",
+          "version": 2
+        },
+        {
+          "name": "outputsTruncated",
+          "type": "bool",
+          "version": 2
+        }
+      ]
+    },
+    {
+      "name": "put-request",
+      "namespace": "bw",
+      "compact": false,
+      "flagsPosition": 1,
+      "fields": [
+        {
+          "name": "kind",
+          "required": true,
+          "type": "uint",
+          "version": 3
+        },
+        {
+          "name": "path",
+          "type": "string",
+          "version": 3
+        },
+        {
+          "name": "chunk",
+          "type": "buffer",
+          "version": 3
+        }
+      ]
+    },
+    {
+      "name": "put-response",
+      "namespace": "bw",
+      "compact": false,
+      "flagsPosition": 0,
+      "fields": [
+        {
+          "name": "ok",
+          "type": "bool",
+          "version": 3
+        },
+        {
+          "name": "files",
+          "type": "uint",
+          "version": 3
+        },
+        {
+          "name": "bytes",
+          "type": "uint",
+          "version": 3
+        },
+        {
+          "name": "message",
+          "type": "string",
+          "version": 3
+        }
+      ]
+    },
+    {
+      "name": "get-request",
+      "namespace": "bw",
+      "compact": false,
+      "flagsPosition": 1,
+      "fields": [
+        {
+          "name": "path",
+          "required": true,
+          "type": "string",
+          "version": 3
+        },
+        {
+          "name": "globs",
+          "array": true,
+          "type": "string",
+          "version": 3
+        }
+      ]
+    },
+    {
+      "name": "get-response",
+      "namespace": "bw",
+      "compact": false,
+      "flagsPosition": 1,
+      "fields": [
+        {
+          "name": "kind",
+          "required": true,
+          "type": "uint",
+          "version": 3
+        },
+        {
+          "name": "chunk",
+          "type": "buffer",
+          "version": 3
+        },
+        {
+          "name": "message",
+          "type": "string",
+          "version": 3
+        },
+        {
+          "name": "files",
+          "type": "uint",
+          "version": 3
+        },
+        {
+          "name": "bytes",
+          "type": "uint",
+          "version": 3
         }
       ]
     }

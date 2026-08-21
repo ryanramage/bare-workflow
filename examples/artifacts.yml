@@ -1,0 +1,44 @@
+# Artifacts across the job graph.
+#
+# Declared on BOTH sides -- what a job produces and what it consumes -- so the data flow is visible
+# in the file before anything runs. That is what will let a farm peer prefetch a task's inputs
+# before it is dispatched.
+version: 1
+name: artifacts
+
+jobs:
+  build:
+    targets: [linux-x64, linux-arm64]
+    artifacts:
+      out:
+        # Interpolated, so each target produces its own artifact rather than four tasks
+        # fighting over one name.
+        - name: app-{{ target }}
+          path: out/**
+          if-no-files-found: error
+    steps:
+      - name: produce something per target
+        run: |
+          mkdir -p out
+          echo "binary for {{ target }}" > out/app
+          echo "{{ target.platform }}" > out/platform.txt
+
+  assemble:
+    needs: build
+    targets: [host]
+    artifacts:
+      in:
+        - name: app-linux-x64
+          to: ./stage/linux-x64
+        - name: app-linux-arm64
+          to: ./stage/linux-arm64
+      out:
+        - name: bundle
+          path: bundle/**
+    steps:
+      - name: assemble what the builds produced
+        run: |
+          mkdir -p bundle
+          cat stage/linux-x64/app stage/linux-arm64/app > bundle/manifest.txt
+          echo "--- bundle ---"
+          cat bundle/manifest.txt

@@ -246,6 +246,81 @@ function lifecycleSuite(test, descriptor) {
       })
     })
 
+    test(tag('a directory can be streamed in and out'), async (t) => {
+      // The only way data crosses the boundary: there are no host mounts, by design and by kernel
+      // restriction. Verified on the real tiers because the transfer path is where a malicious
+      // archive would act, and lib/transfer.js is only useful if it is actually on that path.
+      const fs = require('bare-fs')
+      const stamp = Date.now()
+      const src = `/tmp/bw-life-put-${stamp}`
+      const out = `/tmp/bw-life-get-${stamp}`
+      fs.mkdirSync(src + '/nested', { recursive: true })
+      fs.writeFileSync(src + '/a.txt', 'from the host')
+      fs.writeFileSync(src + '/nested/b.bin', Buffer.from([0, 1, 2, 255]))
+
+      try {
+        await withBox({}, async (box) => {
+          const put = await box.put(src, '/w/src/incoming')
+          t.is(put.files, 2, 'both files arrived')
+
+          const check = box.exec(
+            step('cat /w/src/incoming/a.txt; wc -c < /w/src/incoming/nested/b.bin')
+          )
+          const read = collect(check)
+          const res = await check.wait()
+          t.is(res.code, 0, 'the sandbox can read what we sent\n' + read().err)
+          t.ok(read().out.includes('from the host'), 'text content intact')
+          t.ok(read().out.includes('4'), 'binary length intact')
+
+          const produce = box.exec(
+            step('mkdir -p /w/artifacts/out && echo made-inside > /w/artifacts/out/result.txt')
+          )
+          produce.stdout.on('data', () => {})
+          t.is((await produce.wait()).code, 0, 'produced an artifact')
+
+          const got = await box.get('/w/artifacts/out', out)
+          t.is(got.files, 1, 'one file came back')
+          t.is(
+            fs.readFileSync(out + '/result.txt', 'utf8').trim(),
+            'made-inside',
+            'and its bytes survived'
+          )
+        })
+      } finally {
+        for (const d of [src, out]) {
+          try {
+            fs.rmSync(d, { recursive: true, force: true })
+          } catch {}
+        }
+      }
+    })
+
+    test(tag('a symlink produced in the sandbox is not followed on the way out'), async (t) => {
+      // A build could otherwise plant a link and have the runner copy out anything the sandbox
+      // could read.
+      const fs = require('bare-fs')
+      const out = `/tmp/bw-life-link-${Date.now()}`
+      try {
+        await withBox({}, async (box) => {
+          const setup = box.exec(
+            step(
+              'mkdir -p /w/artifacts/x && echo real > /w/artifacts/x/real.txt && ln -s /etc/hostname /w/artifacts/x/leak'
+            )
+          )
+          setup.stdout.on('data', () => {})
+          t.is((await setup.wait()).code, 0)
+
+          const got = await box.get('/w/artifacts/x', out)
+          t.is(got.files, 1, 'only the real file was packed')
+          t.alike(fs.readdirSync(out), ['real.txt'], 'the symlink did not come out')
+        })
+      } finally {
+        try {
+          fs.rmSync(out, { recursive: true, force: true })
+        } catch {}
+      }
+    })
+
     test(tag('the step has no network'), async (t) => {
       // Cheap end-to-end confirmation that the posture the escape suite proves is the same posture
       // a step actually runs under -- not a separately-configured container.

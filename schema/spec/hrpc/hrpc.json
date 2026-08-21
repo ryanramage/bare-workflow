@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "schema": [
     {
       "id": 0,
@@ -39,6 +39,32 @@
         "stream": true
       },
       "version": 1
+    },
+    {
+      "id": 3,
+      "name": "@bw/put",
+      "request": {
+        "name": "@bw/put-request",
+        "stream": true
+      },
+      "response": {
+        "name": "@bw/put-response",
+        "stream": false
+      },
+      "version": 2
+    },
+    {
+      "id": 4,
+      "name": "@bw/get",
+      "request": {
+        "name": "@bw/get-request",
+        "stream": false
+      },
+      "response": {
+        "name": "@bw/get-response",
+        "stream": true
+      },
+      "version": 2
     }
   ]
 }

@@ -1,0 +1,19 @@
+# Target fan-out: one job definition, one task per target.
+#
+# `{{ target }}` and its parts are in scope, so a single step body covers every target. Targets this
+# host cannot build are reported as skipped rather than silently mapped onto the wrong image.
+version: 1
+name: fanout
+
+jobs:
+  build:
+    targets: [linux-x64, linux-arm64, darwin-arm64, win32-x64]
+    steps:
+      - name: build for {{ target }}
+        run: echo "building {{ target.platform }} / {{ target.arch }}"
+
+  assemble:
+    needs: build
+    targets: [host]
+    steps:
+      - run: echo "assembling whatever the build tasks produced"

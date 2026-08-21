@@ -55,6 +55,7 @@
     "bare-crypto": "^1.15.3",
     "bare-env": "^3.0.1",
     "bare-events": "^2.9.1",
+    "bare-fetch": "^3.2.0",
     "bare-fs": "^4.8.0",
     "bare-path": "^3.1.1",
     "bare-pipe": "^4.2.3",
@@ -62,7 +63,10 @@
     "bare-subprocess": "^6.1.0",
     "hrpc": "^4.3.0",
     "js-yaml": "^5.3.0",
-    "paparam": "^1.13.0"
+    "localdrive": "^2.2.1",
+    "paparam": "^1.13.0",
+    "picomatch": "^4.0.5",
+    "tar-stream": "^3.2.0"
   },
   "devDependencies": {
     "brittle": "^4.1.0",

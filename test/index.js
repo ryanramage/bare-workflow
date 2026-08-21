@@ -8,6 +8,13 @@
 // Unit -- pure functions, no IO.
 require('./schema.js')
 require('./targets.js')
+require('./toolchains.js')
+require('./detect.js')
+require('./interpolate.js')
+require('./graph.js')
+require('./transfer.js')
+require('./store.js')
+require('./prefetch.js')
 require('./argv.js')
 require('./seccomp.js')
 require('./protocol.js')
