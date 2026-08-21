@@ -48,18 +48,41 @@ test('unknown targets throw rather than being guessed at', (t) => {
   t.exception(() => targets.parse(null), /UNKNOWN_TARGET/)
 })
 
-test('describe reports only NATIVE targets', (t) => {
-  // Cross-compiling is sometimes possible, but claiming a capability we cannot honour is worse than
-  // declining: the job fails late and confusingly instead of being routed to a peer that can do it.
+test('describe reports every target this host can produce a USABLE binary for', (t) => {
+  // This replaced a per-platform model ("no darwin from linux"), which was accidentally right for
+  // darwin-arm64 and needlessly wrong for everything else. bare-build never compiles -- it injects
+  // the bundle into a prebuilt runtime with bare-lief -- so cross-linking always works. The only
+  // real constraint is a signature the host cannot issue. Measured, not assumed.
   const linux = targets.describe({ platform: 'linux', arch: 'x64' })
-  t.alike(linux.targets, ['host', 'linux-x64', 'linux-arm64'])
-  t.absent(linux.targets.includes('darwin-arm64'), 'no darwin from linux')
-  t.absent(linux.targets.includes('win32-x64'), 'no windows from linux')
+  t.ok(linux.targets.includes('win32-x64'), 'PE injection needs no Windows')
+  t.ok(linux.targets.includes('win32-arm64'))
+  t.ok(
+    linux.targets.includes('darwin-x64'),
+    'the x64 mach-o runtime has no signature to invalidate'
+  )
+  t.ok(linux.targets.includes('linux-arm64'))
+  t.absent(
+    linux.targets.includes('darwin-arm64'),
+    'an arm64 mach-o must be signed, and only a mac can'
+  )
 
   const mac = targets.describe({ platform: 'darwin', arch: 'arm64' })
-  t.ok(mac.targets.includes('darwin-arm64'))
-  t.ok(mac.targets.includes('ios-arm64'), 'ios comes from a mac')
-  t.absent(mac.targets.includes('linux-x64'))
+  t.ok(mac.targets.includes('darwin-arm64'), 'which is exactly what a mac peer is for')
+  t.ok(mac.targets.includes('ios-arm64'), 'ios always needs a signature too')
+  t.ok(mac.targets.includes('linux-x64'), 'and a mac can cross-link linux just as well')
+})
+
+test('the record separates "cannot build" from "cannot sign"', (t) => {
+  // The distinction is what routing to a mac peer actually solves, so a farm needs it explicitly.
+  const linux = targets.describe({ platform: 'linux', arch: 'x64' })
+  t.ok(linux.unsignable.includes('darwin-arm64'))
+  t.ok(linux.unsignable.includes('ios-arm64'))
+  t.absent(linux.unsignable.includes('win32-x64'), 'unsigned windows binaries still run')
+  t.alike(
+    targets.describe({ platform: 'darwin', arch: 'arm64' }).unsignable,
+    [],
+    'a mac has no gap'
+  )
 })
 
 test('the capability record is shaped like a future announcement', (t) => {
@@ -85,8 +108,8 @@ test('unsatisfied names exactly what cannot be built here', (t) => {
   const caps = targets.describe({ platform: 'linux', arch: 'x64' })
   t.alike(
     targets.unsatisfied(caps, ['host', 'linux-x64', 'darwin-arm64', 'win32-x64']),
-    ['darwin-arm64', 'win32-x64'],
-    'reported, not silently mismapped to a Linux image'
+    ['darwin-arm64'],
+    'only the target that genuinely cannot be produced -- win32 cross-builds fine'
   )
   t.alike(targets.unsatisfied(caps, ['host']), [])
   t.alike(targets.unsatisfied(caps, []), [])
@@ -99,8 +122,11 @@ test('a mac peer satisfies what a linux peer cannot -- the farm premise', (t) =>
   const mac = targets.describe({ platform: 'darwin', arch: 'arm64' })
   const wanted = ['linux-x64', 'darwin-arm64']
 
-  t.alike(targets.unsatisfied(linux, wanted), ['darwin-arm64'])
-  t.alike(targets.unsatisfied(mac, wanted), ['linux-x64'])
+  // The premise is narrower than it used to look, and better for being true: a Linux peer covers
+  // five of six desktop targets on its own, and needs a mac for exactly one -- darwin-arm64, because
+  // only a mac can issue the signature Apple Silicon demands.
+  t.alike(targets.unsatisfied(linux, wanted), ['darwin-arm64'], 'the one real gap')
+  t.alike(targets.unsatisfied(mac, wanted), [], 'a mac happens to cover both')
   const both = wanted.filter((w) => targets.satisfies(linux, w) || targets.satisfies(mac, w))
   t.alike(both, wanted, 'together they cover it')
 })

@@ -2,6 +2,10 @@
 #
 # `{{ target }}` and its parts are in scope, so a single step body covers every target. Targets this
 # host cannot build are reported as skipped rather than silently mapped onto the wrong image.
+#
+# On a Linux host that is `darwin-arm64` and only `darwin-arm64`: an Apple Silicon binary must carry
+# a valid signature and only a Mac can issue one. Windows fans out fine from here -- unsigned, but
+# it runs -- so this workflow builds three of its four targets and reports the fourth.
 version: 1
 name: fanout
 

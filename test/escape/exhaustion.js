@@ -41,7 +41,19 @@ test('workspace writes are capped and cannot fill the host', async (t) => {
     'echo "wrote=$(stat -c %s /w/big 2>/dev/null || echo 0)"'
 
   const res = await h.runHardened('container', ENVP.digest, script, {
-    spec: { limits: { workspaceBytes: 32 * 1024 * 1024, memoryBytes: 512 * 1024 * 1024 } },
+    // Every tmpfs size is set, not just the workspace: they are all RAM-backed and all charged to
+    // the same memory cgroup, so overriding one and inheriting the others is how you end up with a
+    // 1 GiB /tmp under a 512 MiB memory cap. argv.resolveLimits() now refuses that pairing, which is
+    // what makes this spec explicit rather than merely lucky.
+    spec: {
+      limits: {
+        workspaceBytes: 32 * 1024 * 1024,
+        tmpBytes: 32 * 1024 * 1024,
+        shmBytes: 8 * 1024 * 1024,
+        headroomBytes: 64 * 1024 * 1024,
+        memoryBytes: 512 * 1024 * 1024
+      }
+    },
     timeoutMs: 120000
   })
 

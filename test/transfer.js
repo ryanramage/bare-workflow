@@ -247,17 +247,58 @@ test('entry-count and byte caps are enforced', async (t) => {
   )
 })
 
-test('modes are masked, not taken from the archive', async (t) => {
-  // A setuid bit in an artifact is not something to reproduce on the host.
+test('exactly one mode bit survives the archive: owner-execute', async (t) => {
+  // Two requirements that pull against each other, so both are pinned here.
+  //
+  // A setuid bit in an artifact must never reach the host -- but a distributable that comes back
+  // non-executable is not a distributable, and that is the entire point of the artifact store.
+  // So one bit is honoured and everything else is discarded, rather than the mode being carried
+  // through and sanitised.
   const dest = tmp('dest')
   try {
-    await transfer.extract(hostile([{ name: 'x.sh', body: '#!/bin/sh\n', mode: 0o4777 }]), dest)
-    const mode = fs.statSync(dest + '/x.sh').mode & 0o7777
-    t.absent(mode & 0o4000, 'setuid stripped')
-    t.absent(mode & 0o2000, 'setgid stripped')
-    t.is(mode & 0o777, 0o644, 'masked to a plain file mode')
+    await transfer.extract(
+      hostile([
+        { name: 'x.sh', body: '#!/bin/sh\n', mode: 0o4777 },
+        { name: 'data.json', body: '{}', mode: 0o666 }
+      ]),
+      dest
+    )
+
+    const exe = fs.statSync(dest + '/x.sh').mode & 0o7777
+    t.absent(exe & 0o4000, 'setuid stripped')
+    t.absent(exe & 0o2000, 'setgid stripped')
+    t.absent(exe & 0o1000, 'sticky stripped')
+    t.is(
+      exe & 0o777,
+      0o755,
+      'executable, but only ever 0755 -- never the archive world-writable 777'
+    )
+
+    const plain = fs.statSync(dest + '/data.json').mode & 0o7777
+    t.is(plain & 0o777, 0o644, 'a non-executable entry stays non-executable')
   } finally {
     clean(dest)
+  }
+})
+
+test('an executable round-trips, so a distributable is still runnable', async (t) => {
+  // The concrete failure this guards: `bare-build` produces a binary, the artifact store carries it
+  // to an assemble job, and `pear-build` mirrors it into by-arch/. If the execute bit is dropped
+  // anywhere along that path the release folder ships files nobody can run, and nothing fails until
+  // a user double-clicks.
+  const src = tmp('src')
+  const dest = tmp('dest')
+  try {
+    fs.mkdirSync(src, { recursive: true })
+    fs.writeFileSync(src + '/app', '#!/bin/sh\necho hi\n', { mode: 0o755 })
+    fs.writeFileSync(src + '/README', 'not executable\n', { mode: 0o644 })
+
+    await transfer.extract(transfer.pack(src), dest)
+
+    t.ok(fs.statSync(dest + '/app').mode & 0o100, 'the binary is executable on the far side')
+    t.absent(fs.statSync(dest + '/README').mode & 0o111, 'and a data file did not become one')
+  } finally {
+    clean(src, dest)
   }
 })
 

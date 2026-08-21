@@ -125,9 +125,18 @@ test('/tmp is writable and exec-able, /run is noexec', (t) => {
 })
 
 test('swap is disabled by pinning memory-swap to memory', (t) => {
-  const r = argv.build(spec({ limits: { memoryBytes: 1024 } }))
-  t.alike(flagValue(r.args, '--memory'), ['1024b'])
-  t.alike(flagValue(r.args, '--memory-swap'), ['1024b'])
+  // A coherent tiny spec rather than `memoryBytes: 1024`: the tmpfs mounts are charged to the same
+  // cgroup, so the limits are only meaningful together and resolveLimits() now says so.
+  const tiny = {
+    memoryBytes: 256 * 1024 * 1024,
+    workspaceBytes: 64 * 1024 * 1024,
+    tmpBytes: 32 * 1024 * 1024,
+    shmBytes: 8 * 1024 * 1024,
+    headroomBytes: 32 * 1024 * 1024
+  }
+  const r = argv.build(spec({ limits: tiny }))
+  t.alike(flagValue(r.args, '--memory'), ['268435456b'])
+  t.alike(flagValue(r.args, '--memory-swap'), ['268435456b'], 'swap pinned to the same value')
 })
 
 test('env is an explicit allowlist and is sorted', (t) => {
@@ -163,10 +172,10 @@ test('systemd scope carries the CPU limit, because --cpus is inert here', (t) =>
 test('podman and systemd byte syntax do not get crossed', (t) => {
   // systemd rejects podman's 'b' suffix: "Failed to parse MemoryMax= value '4294967296b'".
   // Found by running the argv, not by reading it -- hence a regression test.
-  const r = argv.build(spec({ scope: true, limits: { memoryBytes: 4294967296 } }))
-  t.ok(r.podmanArgs.includes('4294967296b'), 'podman takes the b suffix')
+  const r = argv.build(spec({ scope: true, limits: { memoryBytes: 8589934592 } }))
+  t.ok(r.podmanArgs.includes('8589934592b'), 'podman takes the b suffix')
   const mem = r.args.find((x) => typeof x === 'string' && x.startsWith('MemoryMax='))
-  t.is(mem, 'MemoryMax=4294967296', 'systemd takes a bare integer')
+  t.is(mem, 'MemoryMax=8589934592', 'systemd takes a bare integer')
   t.absent(mem.endsWith('b'), 'a b suffix here is fatal at runtime')
   t.ok(r.args.includes('MemorySwapMax=0'), 'swap off at the scope level too')
 })
@@ -325,9 +334,9 @@ test('full argv snapshot (container tier)', (t) => {
     '--read-only',
     '--read-only-tmpfs=false',
     '--mount',
-    'type=tmpfs,dst=/w,tmpfs-size=8589934592,tmpfs-mode=1777,nosuid,nodev',
+    'type=tmpfs,dst=/w,tmpfs-size=4294967296,tmpfs-mode=1777,nosuid,nodev',
     '--tmpfs',
-    '/tmp:rw,nosuid,nodev,size=2147483648,mode=1777',
+    '/tmp:rw,nosuid,nodev,size=1073741824,mode=1777',
     '--tmpfs',
     '/run:rw,nosuid,nodev,noexec,size=16m,mode=0755',
     '--shm-size',
@@ -336,13 +345,13 @@ test('full argv snapshot (container tier)', (t) => {
     'none',
     '--no-hosts',
     '--memory',
-    '4294967296b',
+    '8589934592b',
     '--memory-swap',
-    '4294967296b',
+    '8589934592b',
     '--pids-limit',
     '512',
     '--ulimit',
-    'nofile=4096:4096',
+    'nofile=65536:65536',
     '--ulimit',
     'nproc=512:512',
     '--ulimit',
@@ -368,4 +377,42 @@ test('full argv snapshot (container tier)', (t) => {
     'localhost/bw-base@' + DIGEST
   ]
   t.alike(r.args, expected, 'any diff here is a deliberate change to the isolation posture')
+})
+
+test('tmpfs sizes and the memory limit are checked against each other', (t) => {
+  // Measured, and the reason this check exists: 1500 MiB written into a 4 GiB tmpfs under
+  // `--memory 1g` is OOM-KILLED at ~1020 MiB. It does not get ENOSPC. So `tmpfs-size` is an upper
+  // bound the memory cgroup can make unreachable, and a spec that promises more workspace than
+  // memory is promising a SIGKILL instead of a disk-full error -- a much worse thing to debug.
+  t.ok(argv.resolveLimits({}), 'the shipped defaults are coherent')
+
+  try {
+    argv.resolveLimits({ limits: { workspaceBytes: 64 * 1024 * 1024 * 1024 } })
+    t.fail('an unreachable workspace cap should be refused')
+  } catch (err) {
+    t.is(err.code, 'INVALID_SPEC')
+    t.ok(/can never be reached/.test(err.message))
+    t.ok(/OOM-kill \(exit 137\) rather than ENOSPC/.test(err.message), 'and says what would happen')
+  }
+
+  // The footgun the check is really for: overriding ONE tmpfs size and inheriting the others.
+  try {
+    argv.resolveLimits({
+      limits: { workspaceBytes: 32 * 1024 * 1024, memoryBytes: 128 * 1024 * 1024 }
+    })
+    t.fail('inheriting a 1 GiB /tmp under a 128 MiB memory cap should be refused')
+  } catch (err) {
+    t.is(err.code, 'INVALID_SPEC', 'shrinking the workspace alone is not enough')
+  }
+
+  const small = argv.resolveLimits({
+    limits: {
+      workspaceBytes: 32 * 1024 * 1024,
+      tmpBytes: 32 * 1024 * 1024,
+      shmBytes: 8 * 1024 * 1024,
+      headroomBytes: 64 * 1024 * 1024,
+      memoryBytes: 512 * 1024 * 1024
+    }
+  })
+  t.is(small.workspaceBytes, 32 * 1024 * 1024, 'a coherent small spec is accepted')
 })

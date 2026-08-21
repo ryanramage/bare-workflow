@@ -1,0 +1,16 @@
+# Pear toolchain image, layered on the node image.
+#
+# Only `pear-build` is installed, deliberately -- not the full pear CLI. `pear build` is a
+# packaging step, not a compiler: it Localdrive-mirrors already-built per-platform bundles into
+# `<target>/by-arch/<plat-arch>/app/`. The standalone `pear-build` package does exactly that with
+# pure-JS dependencies and no network, whereas the full pear CLI wants a long-lived sidecar holding
+# a Corestore and a Hyperswarm -- which is precisely what a `--network none` sandbox cannot and
+# should not host.
+ARG BASE=localhost/bare-workflow-node:dev
+FROM ${BASE}
+
+USER root
+# Pinned: the sandbox has no network at run time, so whatever is baked in is what a build gets, and
+# a floating version would make the image digest in an attestation mean less than it appears to.
+RUN npm install --global --ignore-scripts pear-build@1.2.0 \
+ && npm cache clean --force

@@ -10,6 +10,7 @@ require('./schema.js')
 require('./targets.js')
 require('./toolchains.js')
 require('./detect.js')
+require('./attestation.js')
 require('./interpolate.js')
 require('./graph.js')
 require('./transfer.js')
@@ -30,6 +31,11 @@ require('./argv-runs.js')
 
 // End to end -- the real CLI against the example workflows.
 require('./cli.js')
+require('./hello-pear.js')
+
+// Publishing -- the schema refusals are unit-fast, and the staged flow stands up a real DHT on
+// localhost with a throwaway key, so no network and no real release line is involved.
+require('./publish.js')
 
 // Security -- the escape suite and its negative control. Read test/escape/index.js before trusting
 // any of it: if the negative control stops failing, the rest is measuring nothing.

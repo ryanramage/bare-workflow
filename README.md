@@ -1,42 +1,256 @@
 # bare-workflow
 
-A P2P build farm for Holepunch, running sandboxed workflows on [Bare](https://github.com/holepunchto/bare).
+Build your Pear app for every platform, from one machine, in a sandbox — on [Bare](https://github.com/holepunchto/bare).
 
 > [!NOTE]
-> This is an experimental library, and early. A version 1.0.0 release will signal stability.
-> Today it runs a dependency graph of jobs across targets in microVMs, moves artifacts between them,
-> and installs npm dependencies with **no network at all**. Free-form matrix axes, signing, and the
-> P2P farm are not built yet.
+> Experimental and early; 1.0.0 will signal stability. Linux host only for now — see
+> [Platform support](#platform-support).
+
+Point it at a [hello-pear-bare](https://github.com/holepunchto/hello-pear-bare) project and it
+cross-builds **five of the six desktop distributables from a single Linux machine**, assembles the
+Pear `by-arch/` deployment folder, and stages it — each step in a microVM with no network access.
 
 ```console
-$ bare-workflow run examples/hello.yml
-◉ hello  tier=microvm  1 task
-  ◉ main:host :: echo "hello from inside the sandbox"
-    hello from inside the sandbox
-  ✔ main:host :: echo "hello from inside the sandbox"  36ms
-  ◉ main:host :: uname -r
-    6.12.91
-  ✔ main:host :: uname -r  31ms
-  ✔ main:host: success
+$ bare-workflow run .github/build.yml --concurrency 3
+◉ hello-pear-bare  tier=microvm  toolchain=bare-build  6 tasks
+  ✔ make:linux-x64      7.0s
+  ✔ make:linux-arm64    7.4s
+  ✔ make:win32-x64      3.4s
+  ✔ make:win32-arm64    3.0s
+  ✔ make:darwin-x64     5.5s
+  ⊘ make:darwin-arm64: not buildable here
 ```
 
-That `6.12.91` is the guest kernel, not the host's — the step really ran inside the VM.
+Those are real binaries — `ELF … aarch64`, `PE32+ … ARM64`, `Mach-O … x86_64` — built without a
+compiler, a Windows machine, or a Mac. `darwin-arm64` is the one exception, and it is _reported_
+rather than silently produced; [see below](#why-darwin-arm64-needs-a-mac).
 
-## Why
+## Requirements
 
-`pear build` does not compile anything — it assembles already-built per-platform bundles into
-`<target>/by-arch/<plat-arch>/app/<Name>`. Producing those inputs means running `bare-make` /
-`npm run make` on a machine of that OS, with that OS's signing chain. Emulation cannot fix that,
-so a farm of heterogeneous _real_ peers is the answer, and every job has to be safe to run on
-someone else's machine.
+- **Linux**, x64 or arm64
+- [**Bare**](https://github.com/holepunchto/bare) — `npm i -g bare-runtime`
+- **podman**, rootless is fine — `sudo pacman -S podman` / `sudo apt install podman`
+- **libkrun**, for the microVM tier — `sudo pacman -S libkrun libkrunfw`
 
-That last part is the hard part, and it is where most of the work has gone: the isolation layer came
-first, and the workflow engine is being built on top of it rather than the other way round.
+Check your machine before anything else:
 
-## The workflow
+```console
+$ bare-workflow doctor
+podman     6.1.0
+tiers
+  microvm    rank 90   ✔ available
+  container  rank 50   ✔ available
+platform   linux-x64  (24 cpus)
+targets    host, linux-x64, linux-arm64, darwin-x64, win32-x64, win32-arm64
+toolchains
+  bare        ✔ built     localhost/bare-workflow-base:dev
+  node        ✔ built     localhost/bare-workflow-node:dev
+  bare-build  ✔ built     localhost/bare-workflow-bare-build:dev
+  pear        ✔ built     localhost/bare-workflow-pear:dev
+```
 
-Not GitHub Actions. No `uses:`, no remote action fetching, no expression language. A six-line
-workflow stays six lines:
+If a toolchain says `not built`, build it — see [DEVELOPMENT.md](DEVELOPMENT.md#building-the-images).
+If no tier is available the runner **refuses to run** rather than falling back to something weaker,
+and tells you what to install.
+
+## Your first workflow
+
+Start from the template:
+
+```bash
+git clone https://github.com/holepunchto/hello-pear-bare my-app
+cd my-app
+```
+
+Add `build.yml` to it:
+
+```yaml
+version: 1
+name: my-app
+source: . # the directory to copy into the sandbox
+toolchain: bare-build # the image that has bare-build and the prebuilt runtimes
+
+jobs:
+  make:
+    targets: [linux-x64, linux-arm64, win32-x64, win32-arm64, darwin-x64, darwin-arm64]
+    prefetch: [npm] # download deps on the host, from the lockfile, before the sandbox exists
+    artifacts:
+      out:
+        - name: dist-{{ target }}
+          path: out/{{ target }}/**
+          if-no-files-found: error
+    steps:
+      - name: install, offline
+        run: npm ci --omit=dev --offline --ignore-scripts --cache /w/cache
+
+      - name: make {{ target }}
+        run: npm run make:{{ target }}
+        timeout: 15m
+```
+
+Then run it:
+
+```bash
+bare-workflow run build.yml --concurrency 3
+```
+
+Three things in there are worth understanding, because they are the difference between this working
+and this looking like it worked.
+
+**Call `make:<target>`, never `make`.** The template's `npm run make` reads `os.platform()` and
+builds _one_ target — it is a local convenience, not a matrix. Using it would build a single binary
+and look like it had done all six.
+
+**`prefetch: [npm]` is what makes `network: none` possible.** The runner reads the `resolved` URLs
+and `integrity` hashes already committed in your `package-lock.json`, downloads and verifies those
+exact tarballs on the host, and mounts them read-only into the sandbox. It resolves nothing and runs
+no package code. Inside, `npm ci --offline` installs from that cache with no network at all.
+
+**`{{ target }}` fans the job out.** One job definition becomes one task per target, and the
+artifact name is interpolated so they do not fight over one name.
+
+### Getting your artifacts out
+
+```console
+$ bare-workflow artifacts <run-id>
+  dist-darwin-x64            1 file   79.0 MiB
+  dist-linux-arm64           1 file   94.6 MiB
+  dist-linux-x64             1 file   94.0 MiB
+  dist-win32-arm64           1 file   50.7 MiB
+  dist-win32-x64             1 file   54.2 MiB
+                                  5  372.6 MiB  total
+
+$ bare-workflow artifacts <run-id> --get dist-linux-x64 --to ./dist
+✔ dist-linux-x64 -> ./dist  (1 files, 98567680 bytes)
+```
+
+The extracted binary is executable and runs. On a Linux x64 host you can check immediately:
+
+```console
+$ ./dist/hello-pear-bare --version
+hello-pear-bare v0.0.0-rc.0
+```
+
+## The three deployment stages
+
+The [Pear deployment docs](https://docs.pears.com/how-to/operate-an-app/manual-deployment/deployment/)
+describe three stages. All three are one workflow file — see
+[`examples/hello-pear.yml`](examples/hello-pear.yml) for the complete version.
+
+| Stage                   | Job        | Runs                                           |
+| ----------------------- | ---------- | ---------------------------------------------- |
+| 1. Make distributables  | `make`     | sandboxed, one task per target, no network     |
+| 2. Build deployment dir | `assemble` | sandboxed, `pear-build` over stage 1's output  |
+| 3. Stage                | `stage`    | **trusted** — holds the key, needs the network |
+
+### Stage 2 — the deployment folder
+
+`pear build` does not compile. It mirrors already-built per-target binaries into
+`<target>/by-arch/<plat-arch>/app/`, which is where the OTA updater and `pear-install` look. So it is
+one host-only job consuming stage 1's artifacts:
+
+```yaml
+assemble:
+  needs: make
+  targets: [host]
+  toolchain: pear # a different image: bare-build has the runtimes, pear has the packager
+  artifacts:
+    in:
+      - name: dist-linux-x64
+        to: ./stage/linux-x64
+      # ... one per target
+    out:
+      - name: deployment
+        path: build/**
+  steps:
+    - run: |
+        pear-build --package ./package.json \
+          --linux-x64-app   ./stage/linux-x64/hello-pear-bare \
+          --linux-arm64-app ./stage/linux-arm64/hello-pear-bare \
+          --win32-x64-app   ./stage/win32-x64/hello-pear-bare.exe \
+          --target ./build/hello-pear-bare-1.0.0
+```
+
+> [!IMPORTANT]
+> **The filename must equal your `package.json` `name`.** `pear-runtime-updater` fetches
+> `/by-arch/<host>/app/<name>` and `pear-install` derives the installed binary name the same way,
+> while `bare-build` puts `--name` through a normalizer that lowercases and collapses
+> non-alphanumerics. So `"name": "MyApp"` builds `my-app` while the updater hunts for `MyApp` —
+> `update not found`, long after CI went green. Keep `name` lowercase-and-hyphens and it cannot bite.
+
+### Stage 3 — staging
+
+This is the one job that does **not** run in a sandbox, because it cannot: staging needs a Hyperswarm
+connection and your app's primary key, which are the two things a sandbox exists to withhold. So it
+is a `publish:` job with a deliberately tiny surface — no `steps:`, nothing to run, nowhere for a
+compromised build to sit next to the key:
+
+```yaml
+stage:
+  needs: assemble
+  publish:
+    driver: pear-ci
+    artifact: deployment # a digest-bound tree a sandboxed job produced
+    name: my-app # drive namespace
+    key: my-app # a NAME in your runner config -- never the key itself
+    dry-run: false
+```
+
+Put the key in `~/.config/bare-workflow/config.json`, mode `0600`:
+
+```json
+{ "keys": { "my-app": { "primaryKey": "<64 hex chars>" } } }
+```
+
+Nothing is published without **both** `dry-run: false` in the file and `--publish` on the command
+line. Either alone is a dry run — which still reports the link, so you can preview safely:
+
+```console
+$ bare-workflow run build.yml --publish
+  ◉ stage:host :: publishing deployment -> my-app
+    change /by-arch/linux-x64/app/hello-pear-bare
+  ✔ stage:host: published pear://qdw6pk5qknsa73fzjq3pk6oppeb1ri31qfrsadx4drur7kcm1e3y
+    1 entry changed, snapshot length 4 -> 7
+```
+
+> [!WARNING]
+> **Staging is not finished until another peer has replicated the blocks.** If nothing is seeding your
+> drive, the publish times out and says so. `pear seed` has to be running somewhere permanent — it is
+> infrastructure, not a build step.
+
+Two more things about publishing:
+
+- **The snapshot is durable state**, kept at `<state>/pear/<name>/snapshot.json`. Lose it and the
+  next publish re-uploads everything; copy it to a second machine and the two will diverge on one
+  drive. Keep it.
+- **Promotion is not automated, on purpose.** `pear stage` is documented as being for previews and
+  staging, _not_ production, and multisig exists precisely so one machine cannot redefine a release
+  line. There is no `provision`, `multisig` or `seed` driver and there will not be one.
+
+## Why darwin-arm64 needs a Mac
+
+`bare-build` never compiles. It injects your JS bundle into a _prebuilt_ Bare runtime with
+`bare-lief` — an ELF segment, a PE section, a Mach-O segment — and those runtimes are ordinary npm
+packages with no `os`/`cpu` fields, so every host has all of them. That is why cross-building works
+at all, and why it needs no toolchain.
+
+The exception is signing. The `darwin-arm64` runtime ships **ad-hoc signed**; injecting into it
+invalidates that signature; and Apple Silicon refuses to execute an arm64 Mach-O without a valid one.
+`bare-build` only re-signs when the build host is a Mac. So a Linux-built `darwin-arm64` binary is
+dead on arrival, and the runner reports it instead of producing it.
+
+Capability here is therefore **per target, not per platform**: a target is buildable unless it needs a
+signature this host cannot issue. `darwin-x64` builds fine from Linux (its runtime carries no
+signature to invalidate); `win32-*` build fine (Windows runs unsigned binaries — SmartScreen
+friction, not failure).
+
+Everything cross-built is **unsigned**. Fine on Linux; SmartScreen friction on Windows; Gatekeeper
+quarantine on macOS. Real signing is not implemented yet.
+
+## Writing workflows
+
+Not GitHub Actions: no `uses:`, no remote action fetching, no expression language. A six-line
+workflow stays six lines.
 
 ```yaml
 version: 1
@@ -46,34 +260,32 @@ steps:
   - npm test
 ```
 
-Top-level `steps:` is sugar for a single job named `main`; the full form uses `jobs:`. `version:` is
-required and pinned, so semantics can change later without heuristics.
+Top-level `steps:` is sugar for a single job named `main`. `version:` is required and pinned.
 
-`targets:` is one axis serving two purposes — a build matrix today, and a **placement constraint**
-for the farm tomorrow. `target: darwin-arm64` already means "needs a machine that can build
-darwin-arm64", so capability matching falls out of the schema instead of being bolted on later. The
-vocabulary is closed and identical to `pear build`'s flags, so a typo is a parse error rather than a
-job that silently never runs:
+**Errors name the problem.** Unknown keys, unresolvable `needs`, bad durations, duplicate step ids and
+unknown targets are all rejected with a path, a line and a suggestion — before anything runs:
 
-```
+```console
 $ bare-workflow validate broken.yml
 ✖ SCHEMA_INVALID: targets[0]: unknown target "darwin-arm46"; did you mean "darwin-arm64"? (line 2)
 ```
 
-Error quality is a feature here, not politeness. Unknown keys, unresolvable `needs`, malformed
-durations and duplicate step ids are all rejected with a path, a line, and a suggestion.
-
 ### Interpolation
 
 `{{ }}` over a closed set of roots — `target`, `matrix`, `env`, `needs`, `steps`, `job`, `run` — with
-no functions and no arithmetic. **An unknown reference is a hard error, never an empty string**:
+no functions and no arithmetic. **An unknown reference is a hard error, never an empty string:**
 
-```
+```console
 ✖ EXPR_UNKNOWN_REFERENCE: unknown reference "needs.version.outputs.nope"; available: value
 ```
 
-That single decision removes most of the mystery from a failing workflow. GHA substitutes `''` and
-lets the build carry on doing the wrong thing indefinitely.
+`{{ target }}`, `{{ target.platform }}` and `{{ target.arch }}` are the ones you will use.
+
+> [!TIP]
+> `{{` starts a YAML flow mapping, so an interpolation inside a **flow** sequence will not parse:
+> `steps: [echo '{{ x }}']`. Use block style.
+
+### Conditions
 
 `if:` takes a small predicate grammar — `success()` / `failure()` / `always()` / `cancelled()`, `==`,
 `!=`, `in [...]`, `and` / `or` / `not`, parentheses — with paths written bare:
@@ -83,15 +295,9 @@ lets the build carry on doing the wrong thing indefinitely.
   if: success() and target.platform != 'win32'
 ```
 
-> [!TIP]
-> `{{` starts a YAML flow mapping, so an interpolation inside a **flow** sequence is a syntax error:
-> `steps: [echo '{{ x }}']` will not parse. Use block style, which is what you want for anything
-> non-trivial anyway.
+### Passing values between jobs
 
-### Jobs, targets and data flow
-
-`needs` orders jobs; a job with several targets becomes several tasks, and a dependency waits for all
-of them. Outputs are declared, written to a **file** (`$BW_OUTPUT`), and parsed on the trusted side:
+`needs` orders jobs. Outputs are declared and written to a **file**, never scraped from stdout:
 
 ```yaml
 jobs:
@@ -108,259 +314,104 @@ jobs:
       - run: echo "packaging {{ needs.version.outputs.value }}"
 ```
 
-A file rather than GHA's `::set-output::` stdout scraping, because in a farm log lines are
-attacker-controlled by construction — a build could otherwise forge any output it liked. A file
-descriptor is a capability; stdout is a broadcast.
-
-Reading `needs.<job>.outputs.*` from a job that ran for **several** targets is refused rather than
-guessed at, because there is genuinely more than one value:
-
-```
-✖ needs.multi.outputs.value is ambiguous: multi ran for 2 targets (linux-arm64, linux-x64).
-  Give multi a single target, or read it per target.
-```
-
 ### Toolchains
 
-`toolchain:` selects the sandbox image, and it is what replaces GHA's `uses:` entirely — a curated,
-versioned set rather than fetching third-party code into the runner. Every toolchain image layers on
-the **same base**, so the agent and the isolation posture are identical across all of them: a
-toolchain cannot weaken the sandbox, and there is one place to audit.
+`toolchain:` picks the sandbox image, per workflow or per job. There is no `uses:` and no remote
+code fetching.
 
-```yaml
-version: 1
-toolchain: node # or per job
-steps:
-  - npm ci --offline --ignore-scripts --cache /w/cache
-```
+| Toolchain    | Contains                                                     |
+| ------------ | ------------------------------------------------------------ |
+| `bare`       | the default: bash and the agent, nothing else                |
+| `node`       | node 22 and npm                                              |
+| `bare-build` | node, npm, `bare-build` with all prebuilt runtimes (~1.6 GB) |
+| `pear`       | node, npm, `pear-build` for assembling `by-arch/` folders    |
 
-The default is `bare`: the base image carries the agent and nothing else, so a workflow that needs
-npm has to say so rather than every sandbox shipping tooling it does not use. A typo is caught at
-parse time, and a toolchain whose image has not been built is refused **before anything runs**:
+A typo is caught at parse time, and an image that has not been built is refused **before anything
+runs**, with the command that builds it.
 
-```console
-$ bare-workflow run examples/offline.yml
-✖ required sandbox image not built:
-  toolchain node: localhost/bare-workflow-node:dev
-    build it: podman build -f etc/Containerfile.node -t localhost/bare-workflow-node:dev .
-```
+### Assurances you get for free
 
-`bare-workflow doctor` lists every toolchain and whether it is built. `--image` overrides the lot,
-for trying an image that has no registry entry yet.
-
-## Isolation
-
-Tiers, ranked by what a full compromise of the workload actually buys an attacker:
-
-| Tier                | Mechanism                                                                                 | Boundary                |
-| ------------------- | ----------------------------------------------------------------------------------------- | ----------------------- |
-| `microvm` (default) | `podman --annotation run.oci.handler=krun`, nested inside the hardened container flag set | a separate guest kernel |
-| `container`         | hardened rootless podman + crun                                                           | the host kernel         |
-
-There is deliberately no host-execution tier. A command allowlist over host processes is defeated
-by the first `sh -c`, and it is not offered even as a fallback.
-
-Enable the microVM tier with:
-
-```
-sudo pacman -S libkrun libkrunfw    # crun is already built +LIBKRUN
-```
-
-`crun` selects the microVM path by **annotation**, not `--runtime krun`.
-
-### What the flags actually buy
-
-Two invariants are enforced in `lib/isolation/podman/argv.js` before any argv is emitted:
-
-- **No host bind mounts, ever.** Not a preference — rootless idmapped mounts are kernel-forbidden
-  (`podman-run(1)`: "The Linux kernel does not allow the use of idmapped file systems for
-  unprivileged users"), so a bind mount under `--userns=auto` lands as `nobody` and is unwritable.
-  All data crosses as a validated stream instead, which also deletes the host-path-rebasing problem.
-- **No host environment inheritance.** `bare-subprocess` defaults `env` to the parent's
-  environment, so the alternative is one omission away from handing `GH_TOKEN` to a build.
-
-`--cap-drop=ALL` is the flag doing the heavy lifting on the container tier — measured, it is what
-blocks nested-userns escalation, not the seccomp profile:
-
-```
-podman defaults:   unshare -Ur  ->  uid=0, CapEff: 000001ffffffffff
---cap-drop ALL:    unshare -Ur  ->  write failed /proc/self/uid_map: EPERM
-```
-
-The generated seccomp profile (`etc/seccomp/build-v1.json`) is defense-in-depth on top of that,
-removing reachable kernel surface — several userns/mount LPEs need no capabilities at all.
-
-## The agent
-
-Steps run through a long-lived agent inside the sandbox, speaking [hrpc](https://github.com/holepunchto/hrpc)
-over fd 0/1. Not `podman exec`: a krun microVM cannot be re-entered at all. That constraint turned
-out to be a gift — the same duplex works for a container, a microVM, and later a remote peer over
-hyperdht, so remote dispatch becomes a transport swap rather than a rewrite.
-
-```js
-const { create: sandbox } = require('bare-workflow/sandbox')
-const { create: launcher } = require('bare-workflow/isolation/podman/launcher')
-
-const box = sandbox({ launcher: launcher(spec) })
-await box.prepare() // pay container setup ONCE per job
-
-const run = box.exec({ run: 'npm ci && npm test' }, { timeoutMs: 600000 })
-run.stdout.on('data', (chunk) => Bare.stdout.write(chunk))
-const { code, timedOut, truncated } = await run.wait()
-
-await box.dispose()
-```
-
-`prepare` / `exec` / `dispose` is the shape, so a ten-step job pays setup once instead of ten
-times. Output streams as it happens with byte caps, rather than being collected after exit.
-
-### Getting data in and out
-
-There are no host mounts — rootless idmapped bind mounts are kernel-forbidden, and refusing them
-outright removes the whole bind-mount attack surface along with the host-path-rebasing problem that
-comes with it. So everything crosses as a **validated tar stream**, and `lib/transfer.js` decides
-entry by entry what is allowed to exist:
-
-regular files and directories only (no symlinks, hardlinks, fifos or devices) · no absolute paths ·
-no `..` in any component · no control characters in names · depth, length, entry-count and byte caps ·
-modes masked so a setuid bit cannot survive · case-insensitive collision detection · Windows-reserved
-names rejected · extraction only into a fresh empty directory.
-
-Symlinks are _skipped_ on the way out rather than followed, so a build cannot plant one to smuggle
-out anything the sandbox merely had access to.
-
-Artifacts are declared on both sides, and the name is interpolated so a fan-out job produces one
-artifact per target instead of several tasks fighting over a single name:
-
-```yaml
-jobs:
-  build:
-    targets: [linux-x64, linux-arm64]
-    artifacts:
-      out:
-        - name: app-{{ target }}
-          path: out/**
-          if-no-files-found: error
-
-  assemble:
-    needs: build
-    artifacts:
-      in:
-        - name: app-linux-x64
-          to: ./stage/linux-x64
-```
-
-The store is written against a **drive**, not a path. `localdrive` and `hyperdrive` share a surface,
-so v1 passes a Localdrive and the farm later passes a Hyperdrive — at which point returning an
-artifact from a peer is `drive.mirror()`, and `pear stage` / `seed` / `dump` already speak the format.
-
-### Dependencies with no network
-
-`network: none` is only honest if a real build can still install its dependencies. The runner
-prefetches on the **host**, before any sandbox exists:
-
-```yaml
-version: 1
-source: ./project
-
-jobs:
-  test:
-    prefetch: [npm]
-    steps:
-      - run: npm ci --offline --ignore-scripts --cache /w/cache
-      - run: npm test
-```
+Every task writes an attestation, so what ran and under what isolation is a checkable fact rather
+than a claim:
 
 ```console
-$ bare-workflow run examples/offline.yml --image localhost/bare-workflow-node:dev
-◉ prefetching 1 package from the lockfile
-  ✔ 1 fetched, 0 already cached
-  ↓ test:host :: source  2 files
-  ↓ test:host :: cache  1 files
-  ✔ test:host :: install from the prefetched cache, offline  2.2s
-    confirmed: no default route, no egress
-  ✔ test:host :: run the project's tests  2.3s
+$ bare-workflow attest <run-id>
+run        mt3fxjut  success
+workflow   hello-pear-bare
+tier       microvm  (minimum required: microvm)
+source     e391b8a8330e
+image      localhost/bare-workflow-bare-build:dev@sha256:89395ac6b38a...
+tasks
+  ✔ make:linux-x64           microvm
+                             seccomp ab8863e0a4b21cc4...
+    ↑ dist-linux-x64         1 files  sha256:154c0e61980e...
 ```
 
-Three properties, and the first two are the whole point:
-
-- **It resolves nothing.** Every URL and hash comes from the committed lockfile. No registry
-  metadata request, no version resolution, no dependency solving — if it is not in
-  `package-lock.json` it is not fetched.
-- **It executes no package code.** Nothing is unpacked and no lifecycle script runs; tarballs are
-  downloaded and verified, full stop. That is also why the install uses `--ignore-scripts`, which is
-  already the house style in `actions/node-base`.
-- **Every tarball is verified** against the lockfile's `integrity` before it is kept. A registry
-  serving different bytes than the repository recorded is a supply-chain event, not a retry.
-
-A lockfile pointing at an unexpected host, or missing an integrity hash, is refused before anything
-is fetched.
+It records the tier, the image digest, the sha256 of the seccomp profile that was actually applied,
+the full argv, and a digest over every artifact tree. Records are written for failed tasks too. A
+workflow can _demand_ isolation with `tier: microvm`, and the runner will refuse to run rather than
+quietly give you less.
 
 ## CLI
 
 ```
 bare-workflow validate <file>       # parse and report; exit 1 on a bad workflow
 bare-workflow run <file>            # run it in the strongest available sandbox
-bare-workflow doctor                # what tiers and targets this host supports
-bare-workflow artifacts <run-id>    # list, or --get <name> to extract
+bare-workflow run <file> --publish  # ... and let publish jobs actually publish
+bare-workflow doctor                # tiers, targets and toolchains on this host
+bare-workflow artifacts <run-id>    # list, or --get <name> --to <dir> to extract
+bare-workflow attest <run-id>       # what ran, under what isolation, producing what bytes
 ```
 
-`run` takes `--job <name>`, `--tier <microvm|container>`, `--image <ref>`, `--env KEY=VALUE`
-(repeatable), and `--json` for a newline-delimited event stream using the same `{cmd, tag, data}`
-envelope as `pear --json`.
+`run` also takes:
 
-Exit codes are meaningful: `0` success, `1` a step or workflow failed, `2` usage error, and **`78`
-(EX_CONFIG) when no adequate isolation tier is available** — the host is not configured to run this
-safely, which is deliberately not the same thing as the build failing.
+| Flag                |                                                                             |
+| ------------------- | --------------------------------------------------------------------------- |
+| `--job <name>`      | run one job and its dependencies                                            |
+| `--concurrency <n>` | how many tasks at once (default 1)                                          |
+| `--tier <name>`     | `microvm` (default) or `container`                                          |
+| `--state <dir>`     | where artifacts and run records go (default `.bw-state`)                    |
+| `--env KEY=VALUE`   | extra environment for every step, repeatable                                |
+| `--config <file>`   | runner config holding named keys                                            |
+| `--json`            | newline-delimited `{cmd, tag, data}` events, same envelope as `pear --json` |
 
-## Development
+Exit codes: `0` success, `1` a step or workflow failed, `2` usage error, **`78` the host is not
+configured to run this** — no adequate isolation tier, an unbuilt toolchain image, or a publish key
+that does not resolve. That last one is deliberately distinct from a build failure.
 
-```bash
-npm install
+## Isolation, briefly
 
-npm run build:rpc          # regenerate schema/spec from schema/builder (committed output)
-bare scripts/build/agent.js  # build the agent binary + the sandbox base image
-podman build -f etc/Containerfile.node -t localhost/bare-workflow-node:dev .  # a node toolchain on top
+| Tier                | Mechanism                                                              | Boundary                |
+| ------------------- | ---------------------------------------------------------------------- | ----------------------- |
+| `microvm` (default) | `podman --annotation run.oci.handler=krun`, nested in the hardened set | a separate guest kernel |
+| `container`         | hardened rootless podman + crun                                        | the host kernel         |
 
-npm test
-npm run lint
-```
+There is deliberately **no host-execution tier**. Every step runs with `--network none`,
+`--cap-drop ALL`, a generated seccomp profile, `--userns auto`, a read-only root and no host mounts
+at all — data crosses as a validated tar stream in both directions. Your `~/.ssh`, `~/.npmrc` and
+environment are not reachable from a build, by construction rather than by policy.
 
-`scripts/build/agent.js` is required before the isolated tiers can be tested — the agent is baked
-into the image because there is no mount available to inject it. Without it, `test/lifecycle.js`
-still runs, but says which tiers it skipped and why.
+The full argument list, what each flag buys, and the escape suite that proves it are in
+[DEVELOPMENT.md](DEVELOPMENT.md#isolation).
 
-It takes `--skip-binary` to reuse an existing binary, and **refuses** if that binary is older than
-the agent sources. That guard exists because the failure mode is genuinely misleading: a stale agent
-in a fresh image made every step die with `working directory does not exist: /w/src`, which looks
-exactly like a bug in whatever you changed most recently.
+## Platform support
 
-### Test layout
+| Host            | Status                                                                             |
+| --------------- | ---------------------------------------------------------------------------------- |
+| **linux-x64**   | supported and tested                                                               |
+| **linux-arm64** | expected to work; not yet exercised                                                |
+| **win32**       | **not yet** — known gaps documented in [CLAUDE.md](CLAUDE.md#windows-host-support) |
+| **darwin**      | **not yet** — needs a real VM tier; this is what unlocks `darwin-arm64`            |
 
-| Path                                | What it covers                                                                          |
-| ----------------------------------- | --------------------------------------------------------------------------------------- |
-| `test/schema.js`, `test/targets.js` | the workflow schema and target vocabulary, heavy on rejection cases                     |
-| `test/cli.js`                       | the real CLI against `examples/`, asserting on the `--json` event stream                |
-| `test/argv.js`, `test/seccomp.js`   | pure functions; a full-argv snapshot and the exact seccomp errnos                       |
-| `test/protocol.js`                  | framing contract over an in-memory duplex pair                                          |
-| `test/lifecycle.js`                 | **one** Sandbox suite, run against every launcher — host subprocess, container, microVM |
-| `test/argv-runs.js`                 | the generated argv is actually accepted by podman                                       |
-| `test/escape/`                      | escape suite **and its negative control**                                               |
-| `test/fidelity.js`                  | byte-exactness and backpressure of the stdio transport (`bare test/fidelity.js`)        |
+macOS and Windows peers are the whole point of the P2P farm, and neither is built. The farm itself —
+routing `darwin-arm64` to a Mac peer over hyperdht — is designed for but not implemented.
 
-Two things worth knowing before trusting the suite:
+## Documentation
 
-- **The negative control is the most important test here.** `test/escape/index.js` runs the same
-  probes against a deliberately weakened sandbox and requires them to fail. It has already caught
-  a false pass in this repo: a probe used `ip route`, which is not installed in `ubuntu:24.04`, so
-  both postures reported zero routes and the hardened test passed for the wrong reason.
-- **Escape assertions are tier-aware.** Under krun the workload legitimately runs as uid 0 with a
-  full `CapEff`, because the VM is the boundary rather than the capability set. Asserting
-  `CapEff == 0` there would be a wrong test, so host-safety probes run on both tiers and
-  guest-privilege probes run only on `container`.
-
-`test/support/local-launcher.js` runs the agent as a plain host subprocess with no isolation. It
-lives under `test/` on purpose: there is no code path from a workflow to it.
+- **[DEVELOPMENT.md](DEVELOPMENT.md)** — building the images, running the tests, the isolation
+  internals, and the sharp edges.
+- **[CLAUDE.md](CLAUDE.md)** — design decisions and why, measured findings worth not relearning, and
+  the roadmap.
 
 ## License
 

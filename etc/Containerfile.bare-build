@@ -1,0 +1,27 @@
+# Toolchain for making distributables, layered on the node image.
+#
+# `bare-build` is installed in the IMAGE rather than pulled per-run through the project's lockfile.
+# That is a deliberate trade: the 13 prebuilt Bare runtimes it depends on are ~1 GB, and a
+# lockfile-driven install would mean prefetching and then streaming that gigabyte into every task --
+# six times over for a six-target build. As a baked layer it costs nothing per run.
+#
+# The cost of the trade, stated plainly: the toolchain version comes from this image, not from the
+# project's lockfile, so it is pinned here and recorded in the attestation via the image digest.
+# A project's own `bare-build` devDependency is for local development fidelity.
+ARG BASE=localhost/bare-workflow-node:dev
+FROM ${BASE}
+
+USER root
+RUN npm install --global --ignore-scripts bare-build@1.0.4 \
+ && npm cache clean --force
+
+# Sanity-check at build time that every desktop runtime really is present. The whole cross-building
+# story rests on these existing, and a silently missing one would surface much later as an
+# unbuildable target. Checked on disk rather than via require(), because a globally installed
+# package is not on the local resolution path.
+RUN set -eu; \
+    root="$(npm root -g)/bare-build/node_modules"; \
+    for t in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do \
+      test -d "$root/bare-build-$t" || { echo "missing runtime: bare-build-$t"; exit 1; }; \
+    done; \
+    echo "all desktop runtimes present"

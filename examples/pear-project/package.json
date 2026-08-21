@@ -1,0 +1,8 @@
+{
+  "name": "MyApp",
+  "version": "1.2.3",
+  "private": true,
+  "pear": {
+    "name": "MyApp"
+  }
+}

@@ -30,15 +30,20 @@ function fakeDrive() {
   const map = new Map()
   return {
     map,
-    async put(key, buf) {
-      map.set(key, buf)
+    // `executable` is part of the drive surface -- localdrive and hyperdrive both take it on put and
+    // report it on entries -- so the fake models it too, or it would prove less than it claims.
+    async put(key, buf, opts = {}) {
+      map.set(key, { buf, executable: !!opts.executable })
     },
     async get(key) {
-      return map.get(key) || null
+      const e = map.get(key)
+      return e ? e.buf : null
     },
     async *list(prefix) {
       for (const key of [...map.keys()].sort()) {
-        if (key.startsWith(prefix)) yield { key, value: { blob: map.get(key) } }
+        if (!key.startsWith(prefix)) continue
+        const e = map.get(key)
+        yield { key, value: { blob: e.buf, executable: e.executable } }
       }
     }
   }
@@ -182,4 +187,75 @@ test('fetching a missing artifact is an error, not an empty directory', async (t
 test('the store refuses to be constructed without what it needs', (t) => {
   t.exception(() => new Store({ runId: 'r' }), /requires a drive/)
   t.exception(() => new Store({ drive: fakeDrive() }), /requires a runId/)
+})
+
+test('an executable survives the store, on any drive', async (t) => {
+  // The end-to-end failure this closes: bare-build produces a binary, the store carries it to an
+  // assemble job, pear-build mirrors it into by-arch/. The store used to write every file 0644, so
+  // a release folder shipped binaries nobody could run -- and nothing failed until a user tried.
+  for (const [label, drive] of [
+    ['fake', fakeDrive()],
+    ['localdrive', null]
+  ]) {
+    const src = tmp('exe-src')
+    const out = tmp('exe-out')
+    try {
+      fs.writeFileSync(src + '/app', '#!/bin/sh\n', { mode: 0o755 })
+      fs.writeFileSync(src + '/notes.txt', 'plain\n', { mode: 0o644 })
+
+      const store = drive
+        ? new Store({ drive, runId: 'r-exe' })
+        : localStore({ root: tmp('exe-drive'), runId: 'r-exe' })
+
+      await store.put('app', src)
+      await store.get('app', out)
+
+      t.ok(fs.statSync(out + '/app').mode & 0o100, label + ': the binary is executable')
+      t.absent(fs.statSync(out + '/notes.txt').mode & 0o111, label + ': a data file is not')
+    } finally {
+      clean(src, out)
+    }
+  }
+})
+
+test('the execute bit is part of the artifact digest', async (t) => {
+  // The attestation binds to the digest, so two trees that differ only in which files are runnable
+  // must not collide -- one of them is a working release and the other is not.
+  const a = tmp('dig-a')
+  const b = tmp('dig-b')
+  try {
+    fs.writeFileSync(a + '/app', 'same bytes', { mode: 0o755 })
+    fs.writeFileSync(b + '/app', 'same bytes', { mode: 0o644 })
+
+    const one = await new Store({ drive: fakeDrive(), runId: 'r' }).put('x', a)
+    const two = await new Store({ drive: fakeDrive(), runId: 'r' }).put('x', b)
+
+    t.not(one.digest, two.digest, 'identical content, different artifact')
+  } finally {
+    clean(a, b)
+  }
+})
+
+test('put and get agree on the digest, whatever the traversal order', async (t) => {
+  // These two names are chosen deliberately: `put` walks depth-first so it yields `a/b` before
+  // `a.txt`, while a drive lists keys lexicographically and '.' sorts before '/'. The two orders
+  // disagree, so a digest computed from either traversal would differ between writing and reading --
+  // and the artifact would look corrupted every time it was fetched.
+  const src = tmp('ord-src')
+  const out = tmp('ord-out')
+  try {
+    fs.mkdirSync(src + '/a', { recursive: true })
+    fs.writeFileSync(src + '/a/b', 'nested')
+    fs.writeFileSync(src + '/a.txt', 'sibling')
+
+    const store = localStore({ root: tmp('ord-drive'), runId: 'r' })
+    const put = await store.put('app', src)
+    const got = await store.get('app', out)
+
+    t.is(got.digest, put.digest, 'the digest survives the round trip')
+    t.ok(put.digest.startsWith('sha256:'))
+    t.is(got.files, 2)
+  } finally {
+    clean(src, out)
+  }
 })

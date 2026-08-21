@@ -1,0 +1,63 @@
+# Producing a real Pear deployment folder.
+#
+# `pear build` does not compile anything -- it assembles already-built per-platform bundles into
+# `<target>/by-arch/<plat-arch>/app/`. So the shape is: one job per target producing that platform's
+# bundle, then a single assemble job mirroring them all into one deployment folder.
+#
+# On a Linux host three of these four targets are buildable -- both linux ones and win32-x64, since
+# packaging never needs the target OS. `darwin-arm64` is reported as skipped rather than silently
+# mapped onto a Linux image, because an Apple Silicon binary needs a signature only a Mac can issue.
+# That single gap is exactly what the P2P farm is for: routing `darwin-arm64` to a Mac peer.
+version: 1
+name: pear
+source: ./pear-project
+toolchain: pear
+
+jobs:
+  bundle:
+    targets: [linux-x64, linux-arm64, darwin-arm64, win32-x64]
+    artifacts:
+      out:
+        - name: bundle-{{ target }}
+          path: out/**
+          if-no-files-found: error
+    steps:
+      # Stand-in for `bare-build` / `npm run make`. The filename matters: pear-build hard-errors
+      # unless it matches package.json's name (or productName).
+      - name: build the {{ target }} bundle
+        run: |
+          mkdir -p "out/MyApp-{{ target }}"
+          case "{{ target.platform }}" in
+            linux)  ext=AppImage ;;
+            darwin) ext=app ;;
+            win32)  ext=msix ;;
+          esac
+          printf 'bundle for %s\n' "{{ target }}" > "out/MyApp-{{ target }}/MyApp.$ext"
+
+  assemble:
+    needs: bundle
+    targets: [host]
+    artifacts:
+      in:
+        - name: bundle-linux-x64
+          to: ./stage/linux-x64
+        - name: bundle-linux-arm64
+          to: ./stage/linux-arm64
+        - name: bundle-win32-x64
+          to: ./stage/win32-x64
+      out:
+        - name: deployment
+          path: build/**
+          if-no-files-found: error
+    steps:
+      - name: assemble the by-arch deployment folder
+        run: |
+          pear-build \
+            --package ./package.json \
+            --linux-x64-app   ./stage/linux-x64/MyApp-linux-x64/MyApp.AppImage \
+            --linux-arm64-app ./stage/linux-arm64/MyApp-linux-arm64/MyApp.AppImage \
+            --win32-x64-app   ./stage/win32-x64/MyApp-win32-x64/MyApp.msix \
+            --target ./build/MyApp-1.2.3
+
+      - name: show what pear will consume
+        run: find build -maxdepth 5 | sort

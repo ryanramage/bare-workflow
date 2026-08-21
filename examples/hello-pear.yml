@@ -1,0 +1,132 @@
+# Stage 1 of the Pear deployment flow: make distributables.
+#
+# One task per target, each calling the project's own `make:<target>` script -- NOT `npm run make`,
+# which the template deliberately restricts to the host platform and would quietly build one target
+# while looking like it had done the matrix.
+#
+# `bare-build` never compiles: it injects the JS bundle into a prebuilt Bare runtime with bare-lief.
+# So five of these six targets cross-build from a single Linux machine. `darwin-arm64` does not, and
+# the reason is worth knowing: the arm64 runtime ships ad-hoc signed, injection invalidates that
+# signature, and only `codesign` on a Mac can reissue it. A Linux-built arm64 Mach-O is dead on
+# arrival, so it is reported as unbuildable here rather than silently produced.
+version: 1
+name: hello-pear
+source: ./hello-pear
+toolchain: bare-build
+
+# The upgrade link is compiled into the binary. Assert it matches the project rather than trusting it.
+expect:
+  upgrade: pear://kv8bmfbpc9dcxhqmrp8xrxzbjfawcqrpwwx8kwqxeu9dxpcgnwno
+
+jobs:
+  make:
+    targets: [linux-x64, linux-arm64, win32-x64, win32-arm64, darwin-x64, darwin-arm64]
+    prefetch: [npm]
+    artifacts:
+      out:
+        - name: dist-{{ target }}
+          path: out/{{ target }}/**
+          if-no-files-found: error
+    steps:
+      # --omit=dev because the toolchain comes from the image, not the lockfile. Prefetching
+      # bare-build's 13 prebuilt runtimes (~1 GB) to install something already present would make a
+      # first run unusable for nothing.
+      - name: install runtime deps, offline
+        run: npm ci --omit=dev --offline --ignore-scripts --cache /w/cache
+
+      - name: make {{ target }}
+        run: npm run make:{{ target }}
+        timeout: 10m
+
+      - name: report what was produced
+        run: |
+          f=$(find out/{{ target }} -type f | head -1)
+          printf '%s  %s bytes\n' "$f" "$(stat -c %s "$f")"
+
+  # Stage 2: build the deployment directory.
+  #
+  # `pear build` does not compile -- it Localdrive-mirrors already-built per-target binaries into
+  # `<target>/by-arch/<plat-arch>/app/`, which is the layout the OTA updater and `pear-install` both
+  # look in. So it is one host-only job consuming the fan-out's artifacts, and it needs a different
+  # toolchain than the job that produced them: `bare-build` has the 13 prebuilt runtimes, `pear`
+  # has the packager. Per-job `toolchain:` keeps each sandbox to what it actually needs.
+  assemble:
+    needs: make
+    targets: [host]
+    toolchain: pear
+    artifacts:
+      in:
+        - name: dist-linux-x64
+          to: ./stage/linux-x64
+        - name: dist-linux-arm64
+          to: ./stage/linux-arm64
+        - name: dist-win32-x64
+          to: ./stage/win32-x64
+        - name: dist-win32-arm64
+          to: ./stage/win32-arm64
+        - name: dist-darwin-x64
+          to: ./stage/darwin-x64
+      out:
+        - name: deployment
+          path: build/**
+          if-no-files-found: error
+    steps:
+      # Five of six. `darwin-arm64` is absent because this host cannot sign it, so the folder is a
+      # complete release for every platform except Apple Silicon -- which is the honest state of a
+      # single-machine build, and exactly the hole a Mac peer in the farm fills. Note the filenames:
+      # pear-build hard-errors unless each one matches package.json's `name`, and `bare-build`'s
+      # `--name` is put through a normalizer, so the two agreeing is a real invariant, not a habit.
+      - name: assemble the by-arch deployment folder
+        run: |
+          pear-build \
+            --package ./package.json \
+            --linux-x64-app    ./stage/linux-x64/hello-pear \
+            --linux-arm64-app  ./stage/linux-arm64/hello-pear \
+            --win32-x64-app    ./stage/win32-x64/hello-pear.exe \
+            --win32-arm64-app  ./stage/win32-arm64/hello-pear.exe \
+            --darwin-x64-app   ./stage/darwin-x64/hello-pear \
+            --target ./build/hello-pear-1.0.0
+
+      - name: show what pear will stage, and that it is still executable
+        run: |
+          find build -maxdepth 5 | sort
+          test -x build/hello-pear-1.0.0/by-arch/linux-x64/app/hello-pear
+          echo "linux-x64 binary is executable after the round trip"
+
+  # Stage 3: stage the app.
+  #
+  # This is the one job in the whole project that does NOT run in a sandbox, and the boundary is
+  # worth understanding rather than working around. `pear stage` needs a Hyperswarm connection and
+  # the app's primary key -- exactly the two things a sandbox exists to withhold. So instead of
+  # weakening the sandbox to fit the job, the job moves outside it and its surface is made tiny:
+  #
+  #   * there is no `steps:` -- a publish job runs no user code at all, so there is nowhere for a
+  #     compromised build to put a command next to the key;
+  #   * its only input is a NAMED ARTIFACT the store already holds and has digest-bound, so what
+  #     gets published is a reviewable tree rather than whatever a script left on disk;
+  #   * `key:` is a NAME resolved against the runner's own config. The secret never appears in this
+  #     file, and the field will not accept one even if you paste it in.
+  #
+  # It needs a configured key. Put one in ~/.config/bare-workflow/config.json (mode 0600):
+  #   { "keys": { "hello-pear": { "primaryKey": "<64 hex chars>" } } }
+  # The run refuses in seconds if that is missing, before building anything.
+  #
+  # Nothing is published without BOTH `dry-run: false` here and `--publish` on the command line.
+  # Publishing is the only irreversible thing a run does, so it takes two deliberate acts.
+  #
+  # Deliberately absent: `provision`, `multisig` and `seed`. Staging is where a build tool should
+  # stop. The docs are explicit that `pear stage` is "for internal previews, staging, and ephemeral
+  # variations -- not for production", and that multisig exists so "one compromised machine cannot
+  # redefine the release line" -- which putting a quorum of signing keys on one runner would defeat
+  # entirely. Seeding is infrastructure that must outlive a build, not a job.
+  stage:
+    needs: assemble
+    publish:
+      driver: pear-ci
+      artifact: deployment
+      name: hello-pear
+      key: hello-pear
+      # `false` is what a real release line says: this workflow exists to publish. The protection is
+      # the second affirmation -- `--publish` on the command line -- so this file stays safe to run
+      # for any other purpose, and a dry run is what you get by default.
+      dry-run: false

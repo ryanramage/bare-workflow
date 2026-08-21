@@ -12,7 +12,15 @@
     "./agent": "./lib/agent/index.js",
     "./isolation/podman/argv": "./lib/isolation/podman/argv.js",
     "./isolation/podman/seccomp": "./lib/isolation/podman/seccomp.js",
-    "./isolation/podman/launcher": "./lib/isolation/podman/launcher.js"
+    "./isolation/podman/launcher": "./lib/isolation/podman/launcher.js",
+    "./schema": "./lib/schema/index.js",
+    "./targets": "./lib/targets.js",
+    "./store": "./lib/store/index.js",
+    "./transfer": "./lib/transfer.js",
+    "./attestation": "./lib/attestation.js",
+    "./config": "./lib/config.js",
+    "./publish": "./lib/publish/index.js",
+    "./publish/pear-ci": "./lib/publish/pear-ci.js"
   },
   "files": [
     "package.json",
@@ -22,6 +30,8 @@
     "schema/builder",
     "etc",
     "README.md",
+    "CLAUDE.md",
+    "DEVELOPMENT.md",
     "LICENSE",
     "NOTICE"
   ],
@@ -65,10 +75,12 @@
     "js-yaml": "^5.3.0",
     "localdrive": "^2.2.1",
     "paparam": "^1.13.0",
+    "pear-ci": "^0.1.1",
     "picomatch": "^4.0.5",
     "tar-stream": "^3.2.0"
   },
   "devDependencies": {
+    "@hyperswarm/testnet": "^3.1.4",
     "brittle": "^4.1.0",
     "hyperschema": "^1.22.0",
     "lunte": "^1.8.4",

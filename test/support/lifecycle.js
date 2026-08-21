@@ -295,6 +295,58 @@ function lifecycleSuite(test, descriptor) {
       }
     })
 
+    test(tag('an executable survives the round trip in both directions'), async (t) => {
+      // A regression test for a real, silent failure: the agent shares lib/transfer.js, and while
+      // that file wrote every extracted file 0644 an executable sent INTO a sandbox arrived
+      // non-executable. Nothing failed -- the build succeeded, the artifact came back, and the
+      // release folder shipped binaries nobody could run. It also means a stale baked agent
+      // reintroduces the bug invisibly, so this asserts on the real tiers rather than in a unit test.
+      const fs = require('bare-fs')
+      const stamp = Date.now()
+      const src = `/tmp/bw-life-exe-in-${stamp}`
+      const out = `/tmp/bw-life-exe-out-${stamp}`
+      fs.mkdirSync(src, { recursive: true })
+      fs.writeFileSync(src + '/tool', '#!/bin/sh\necho ran\n', { mode: 0o755 })
+      fs.writeFileSync(src + '/data', 'not executable\n', { mode: 0o644 })
+
+      try {
+        await withBox({}, async (box) => {
+          await box.put(src, '/w/src/bin')
+
+          // Asserted from inside with `test -x`, not by reading a mode we wrote ourselves.
+          const check = box.exec(
+            step(
+              'test -x /w/src/bin/tool && echo TOOL-EXEC; test -x /w/src/bin/data || echo DATA-PLAIN; /w/src/bin/tool'
+            )
+          )
+          const read = collect(check)
+          const res = await check.wait()
+          t.is(res.code, 0, 'the sandbox could run what we sent\n' + read().err)
+          t.ok(read().out.includes('TOOL-EXEC'), 'the executable arrived executable')
+          t.ok(read().out.includes('DATA-PLAIN'), 'and a data file did not become one')
+          t.ok(read().out.includes('ran'), 'and it actually executes')
+
+          const produce = box.exec(
+            step(
+              'mkdir -p /w/artifacts/b && printf "#!/bin/sh\\n" > /w/artifacts/b/made && chmod +x /w/artifacts/b/made && echo plain > /w/artifacts/b/notes'
+            )
+          )
+          produce.stdout.on('data', () => {})
+          t.is((await produce.wait()).code, 0, 'produced an executable inside')
+
+          await box.get('/w/artifacts/b', out)
+          t.ok(fs.statSync(out + '/made').mode & 0o100, 'and it is still executable on the host')
+          t.absent(fs.statSync(out + '/notes').mode & 0o111, 'while a plain file stays plain')
+        })
+      } finally {
+        for (const d of [src, out]) {
+          try {
+            fs.rmSync(d, { recursive: true, force: true })
+          } catch {}
+        }
+      }
+    })
+
     test(tag('a symlink produced in the sandbox is not followed on the way out'), async (t) => {
       // A build could otherwise plant a link and have the runner copy out anything the sandbox
       // could read.

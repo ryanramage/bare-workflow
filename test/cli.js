@@ -78,7 +78,8 @@ test('validate accepts the examples', async (t) => {
     'examples/graph.yml',
     'examples/fanout.yml',
     'examples/artifacts.yml',
-    'examples/offline.yml'
+    'examples/offline.yml',
+    'examples/pear.yml'
   ]) {
     const r = await cli(['validate', file], 60000)
     t.is(r.code, 0, file + ' is valid\n' + r.stderr)
@@ -352,8 +353,11 @@ test(
     const unsupported = evs
       .filter((e) => e.cmd === 'task' && e.tag === 'unsupported')
       .map((e) => e.data.target)
-    t.ok(unsupported.includes('darwin-arm64'), 'darwin is not buildable on a linux host')
-    t.ok(unsupported.includes('win32-x64'), 'nor is windows')
+    t.alike(
+      unsupported,
+      ['darwin-arm64'],
+      'exactly one gap on a linux host, and win32 is NOT it -- packaging never needs the target OS'
+    )
 
     const out = evs
       .filter((e) => e.cmd === 'stdout')
@@ -615,6 +619,276 @@ test('the offline example runs with no flags at all', { timeout: 300000 }, async
     t.ok(out.includes('confirmed: no default route'), 'and it really had no network')
     t.ok(out.includes('dependency works offline'), 'while still installing and using a dependency')
   } finally {
+    try {
+      fsx.rmSync(state, { recursive: true, force: true })
+    } catch {}
+  }
+})
+
+// --- M5: attestation and pear packaging ------------------------------------------------
+
+test('a run writes an attestation for every task', { timeout: 300000 }, async (t) => {
+  const can = runnable()
+  if (!can.ok) {
+    t.comment('skipping: ' + can.why)
+    return t.pass('skipped')
+  }
+
+  const fsx = require('bare-fs')
+  const attestation = require('../lib/attestation.js')
+  const state = '/tmp/bw-cli-attest-' + Date.now()
+  try {
+    const r = await cli(
+      [
+        'run',
+        'examples/artifacts.yml',
+        '--json',
+        '--concurrency',
+        '2',
+        '--state',
+        state,
+        '--tier',
+        can.tier
+      ],
+      300000
+    )
+    t.is(r.code, 0, 'the run succeeded\n' + r.stderr)
+
+    const start = events(r.stdout).find((e) => e.cmd === 'run' && e.tag === 'start')
+    const runId = Object.keys(
+      fsx.readdirSync(state + '/runs').reduce((a, k) => ({ ...a, [k]: 1 }), {})
+    )[0]
+    t.ok(runId, 'a run directory exists')
+    void start
+
+    const { summary, tasks } = attestation.read(state, runId)
+    t.ok(summary, 'a run summary was written')
+    t.is(summary.status, 'success')
+    t.is(tasks.length, 3, 'one record per task')
+
+    for (const record of tasks) {
+      // The posture, precisely: not "microvm" but the exact invocation and the profile's content.
+      t.is(record.isolation.tier, can.tier, record.task.id + ' records its tier')
+      t.ok(record.isolation.argv.includes('--network'), record.task.id + ' records the real argv')
+      t.ok(
+        /^[0-9a-f]{64}$/.test(record.isolation.seccomp.sha256),
+        record.task.id + ' hashes the seccomp profile'
+      )
+      t.ok(
+        record.isolation.image.includes('@sha256:'),
+        record.task.id + ' pins the image by digest'
+      )
+    }
+
+    // And it binds to the bytes, so an attestation cannot be paired with different output.
+    const withArtifacts = tasks.filter((x) => x.outputs.artifacts.length > 0)
+    t.ok(withArtifacts.length >= 2, 'artifact-producing tasks recorded them')
+    for (const record of withArtifacts) {
+      for (const a of record.outputs.artifacts) {
+        t.ok(/^sha256:[0-9a-f]{64}$/.test(a.digest), `${a.name} carries a content digest`)
+      }
+    }
+
+    // Distinct targets produced distinct bytes, so their digests must differ.
+    const digests = withArtifacts.flatMap((x) => x.outputs.artifacts.map((a) => a.digest))
+    t.is(new Set(digests).size, digests.length, 'per-target artifacts have distinct digests')
+  } finally {
+    try {
+      fsx.rmSync(state, { recursive: true, force: true })
+    } catch {}
+  }
+})
+
+test(
+  'a declared tier is a minimum, and both it and the actual tier are recorded',
+  { timeout: 240000 },
+  async (t) => {
+    const can = runnable()
+    if (!can.ok) {
+      t.comment('skipping: ' + can.why)
+      return t.pass('skipped')
+    }
+    const fsx = require('bare-fs')
+    const attestation = require('../lib/attestation.js')
+    const tmpf = '/tmp/bw-cli-tier-' + Date.now() + '.yml'
+    const state = '/tmp/bw-cli-tier-state-' + Date.now()
+    fsx.writeFileSync(tmpf, 'version: 1\ntier: container\nsteps:\n  - echo ok\n')
+    try {
+      const r = await cli(['run', tmpf, '--json', '--state', state], 240000)
+      t.is(r.code, 0)
+      const runId = fsx.readdirSync(state + '/runs')[0]
+      const { summary } = attestation.read(state, runId)
+      t.is(summary.run.minTier, 'container', 'the declared requirement is recorded')
+      // Declaring a weaker minimum does not opt out of the strongest tier available.
+      t.ok(
+        summary.run.tier === 'microvm' || summary.run.tier === 'container',
+        'and what actually ran'
+      )
+    } finally {
+      try {
+        fsx.unlinkSync(tmpf)
+        fsx.rmSync(state, { recursive: true, force: true })
+      } catch {}
+    }
+  }
+)
+
+test(
+  'the pear example produces a real by-arch deployment folder',
+  { timeout: 600000 },
+  async (t) => {
+    const can = runnable()
+    if (!can.ok) {
+      t.comment('skipping: ' + can.why)
+      return t.pass('skipped')
+    }
+    const detectLib = require('../lib/isolation/detect.js')
+    const toolchainLib = require('../lib/toolchains.js')
+    const fsx = require('bare-fs')
+
+    const pearImage = toolchainLib.resolve('pear').image
+    const probe = detectLib.probe({ image: pearImage })
+    if (probe.tiers.every((x) => !x.available)) {
+      t.comment('skipping: the pear toolchain image is not built')
+      return t.pass('skipped')
+    }
+
+    const state = '/tmp/bw-cli-pear-' + Date.now()
+    const out = '/tmp/bw-cli-pear-out-' + Date.now()
+    try {
+      const r = await cli(
+        ['run', 'examples/pear.yml', '--json', '--concurrency', '2', '--state', state],
+        600000
+      )
+      if (r.code === 78 && /not built/.test(r.stdout + r.stderr)) {
+        t.comment('skipping: pear toolchain image not built')
+        return t.pass('skipped')
+      }
+      t.is(r.code, 0, 'the run succeeded\n' + r.stderr)
+
+      const evs = events(r.stdout)
+      // darwin-arm64 is reported, never silently mapped onto a Linux image -- that gap is
+      // precisely what the farm exists to close.
+      const unsupported = evs
+        .filter((e) => e.cmd === 'task' && e.tag === 'unsupported')
+        .map((e) => e.data.target)
+      t.alike(unsupported, ['darwin-arm64'], 'the one target this host cannot produce usably')
+
+      const stdout = evs
+        .filter((e) => e.cmd === 'stdout')
+        .map((e) => e.data)
+        .join('')
+      t.ok(stdout.includes('by-arch/linux-x64/app'), 'pear-build produced the by-arch layout')
+
+      // The real check: extract the artifact and confirm it is the shape pear consumes.
+      const runId = fsx.readdirSync(state + '/runs')[0]
+      const { localStore } = require('../lib/store')
+      const store = localStore({ root: state + '/artifacts', runId })
+      const got = await store.get('deployment', out)
+      t.ok(got.files >= 3, 'the deployment folder came back as an artifact')
+
+      const files = []
+      const walk = (dir, prefix) => {
+        for (const name of fsx.readdirSync(dir)) {
+          const p = dir + '/' + name
+          if (fsx.statSync(p).isDirectory()) walk(p, prefix + name + '/')
+          else files.push(prefix + name)
+        }
+      }
+      walk(out, '')
+      t.ok(
+        files.some((f) => /by-arch\/linux-x64\/app\/MyApp\.AppImage$/.test(f)),
+        'x64 bundle in place: ' + files.join(', ')
+      )
+      t.ok(
+        files.some((f) => /by-arch\/win32-x64\/app\/MyApp\.msix$/.test(f)),
+        'and the windows bundle, cross-built on this same linux host'
+      )
+      t.ok(
+        files.some((f) => /by-arch\/linux-arm64\/app\/MyApp\.AppImage$/.test(f)),
+        'arm64 bundle in place'
+      )
+      t.ok(
+        files.some((f) => /package\.json$/.test(f)),
+        'and the package.json pear reads'
+      )
+    } finally {
+      for (const d of [state, out]) {
+        try {
+          fsx.rmSync(d, { recursive: true, force: true })
+        } catch {}
+      }
+    }
+  }
+)
+
+test('`artifacts` lists names, sizes and a total', { timeout: 240000 }, async (t) => {
+  // This output is documented in the README, so it is a contract. A distributable is ~80 MB and the
+  // size is the number you would run this command to check, so a listing without it is not much of a
+  // listing.
+  const can = runnable()
+  if (!can.ok) {
+    t.comment('skipping: ' + can.why)
+    return t.pass('skipped')
+  }
+  const fsx = require('bare-fs')
+  const state = '/tmp/bw-cli-artlist-' + Date.now()
+  const tmpf = '/tmp/bw-cli-artlist-' + Date.now() + '.yml'
+  try {
+    fsx.writeFileSync(
+      tmpf,
+      [
+        'version: 1',
+        'name: artlist',
+        'jobs:',
+        '  build:',
+        '    targets: [host]',
+        '    artifacts:',
+        '      out:',
+        '        - name: small',
+        '          path: out/**',
+        '        - name: bigger',
+        '          path: big/**',
+        '    steps:',
+        '      - run: |',
+        '          mkdir -p out big',
+        '          echo hi > out/a.txt',
+        '          head -c 3000000 /dev/zero > big/blob.bin',
+        ''
+      ].join('\n')
+    )
+    const run = await cli(['run', tmpf, '--state', state, '--tier', can.tier])
+    t.is(run.code, 0, 'the run succeeded\n' + run.stderr.slice(0, 400))
+
+    const runId = fsx.readdirSync(state + '/runs')[0]
+    const list = await cli(['artifacts', runId, '--state', state])
+    t.is(list.code, 0)
+
+    // Names in sorted order, each with a file count and a human-readable size.
+    t.ok(/bigger\s+1 file\s+2\.9 MiB/.test(list.stdout), 'sizes are binary units: ' + list.stdout)
+    t.ok(/small\s+1 file\s+3 B/.test(list.stdout), 'and small files do not become "0.0 KiB"')
+    t.ok(/\s2\s+2\.9 MiB\s+total/.test(list.stdout), 'plus a total line')
+
+    // The digest is deliberately NOT here -- computing it means reading every byte. `attest` has it.
+    t.absent(/sha256:/.test(list.stdout), 'listing stays cheap')
+
+    const got = await cli([
+      'artifacts',
+      runId,
+      '--state',
+      state,
+      '--get',
+      'small',
+      '--to',
+      state + '/x'
+    ])
+    t.is(got.code, 0)
+    t.ok(/small -> /.test(got.stdout), 'and --get reports where it went')
+    t.is(fsx.readFileSync(state + '/x/a.txt', 'utf8').trim(), 'hi')
+  } finally {
+    try {
+      fsx.unlinkSync(tmpf)
+    } catch {}
     try {
       fsx.rmSync(state, { recursive: true, force: true })
     } catch {}
