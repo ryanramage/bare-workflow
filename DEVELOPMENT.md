@@ -90,6 +90,14 @@ exactly like a bug in whatever you changed most recently.
 > handling in `transfer.js`, artifacts still came back non-executable because the baked agent was
 > still writing `0644` on the way in. Rebuilding is `bare scripts/build/agent.js` plus the three
 > `podman build` lines — the layered images must be rebuilt because they are `FROM` the base.
+>
+> **This includes pulling a branch, not just editing.** `out/` is gitignored, so a checkout that
+> changes `lib/agent/` leaves you with a binary older than the source and nothing says so until a
+> step behaves oddly. Hit for real moving the macOS branch back to Linux: the branch added an
+> `fdScan` field to the hello response and the stale agent did not have it, so the handshake reported
+> `unknown: agent predates the fdScan field`. That one surfaced cleanly because the field is
+> explicitly version-checked — the general case does not. **Rebuild after any checkout that touches
+> `lib/`.**
 
 The images layer strictly:
 

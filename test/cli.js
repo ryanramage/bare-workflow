@@ -764,7 +764,18 @@ test(
     const state = '/tmp/bw-cli-tier-state-' + Date.now()
     fsx.writeFileSync(tmpf, 'version: 1\ntier: container\nsteps:\n  - echo ok\n')
     try {
-      const r = await cli(['run', tmpf, '--json', '--state', state, '--tier', can.tier], 240000)
+      // Deliberately NO `--tier` here, unlike the other run tests. `--tier` is an explicit override
+      // that supersedes the workflow's declaration, so passing it defeats the one thing this test
+      // exists to check. It also does not need it: the workflow declares `container`, which is
+      // satisfiable on any machine that can run these tests at all -- the runner picks the STRONGEST
+      // tier at or above the declared minimum, so this runs under microvm on Linux and container on
+      // a Mac, and asserts the same thing on both.
+      //
+      // It was briefly `--tier can.tier`, added as a blanket fix so macOS runs would not exit 78 on
+      // the default microvm minimum. That made the test pass on a Mac (where can.tier IS 'container')
+      // and fail on Linux (where it is 'microvm' and therefore overrode the declaration) -- a test
+      // whose result depended on which machine you were on.
+      const r = await cli(['run', tmpf, '--json', '--state', state], 240000)
       t.is(r.code, 0)
       const runId = runIdOf(t, fsx, state)
       if (!runId) return

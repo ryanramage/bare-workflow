@@ -306,9 +306,16 @@ weakness the generator exists to fix, and that one now works on macOS by reading
 podman machine.
 
 Note the committed profile itself was **not** regenerated — it is correct, and the escape suite plus
-the new arch test confirm it denies what it should on arm64. **The pin still needs capturing on the
-Linux box that produced it** (`bare scripts/build/seccomp.js --capture`); until then the drift guard
-skips and says so.
+the new arch test confirm it denies what it should on arm64.
+
+**The pin is now captured** (`etc/seccomp/base-v1.json`, from Arch `containers-common 1:0.69.1-1`,
+the host that produced the committed profile). Two things were verified rather than assumed at
+capture time: `bare scripts/build/seccomp.js --check` reports **up to date**, so the pin reproduces
+the committed `build-v1.json` byte-for-byte — which is what proves the pin describes the real input
+rather than merely being _a_ base; and the sha256 it generates, `ab8863e0a4b21cc4…`, is the one
+already recorded in existing attestations, so nothing about the shipped posture moved. Both AF_VSOCK
+bullets above were confirmed present in the captured pin and carried through to the output. The drift
+guard now runs instead of skipping.
 
 #### Answers to the macOS blockers, now measured
 
@@ -727,5 +734,15 @@ Things that have gone wrong in this project's own development, worth avoiding:
   while the logs looked fine.
 - **A green suite can mean nothing.** The negative control exists because of this. When adding a
   security test, also make it fail against the weakened provider.
+- **Round-trip the branch between machines before believing it.** Bringing the macOS branch back to
+  Linux caught two things a single-machine run could not. (a) A stale baked agent: `out/` is
+  gitignored, so a checkout that changes `lib/agent/` leaves a binary older than its source — the
+  handshake reported `unknown: agent predates the fdScan field`, which only surfaced cleanly because
+  that field is explicitly version-checked. (b) A test made host-dependent by a blanket fix: adding
+  `--tier can.tier` to every run test so macOS would not exit 78 was right everywhere except the one
+  test asserting that a workflow's `tier:` declaration is honoured — `--tier` is precisely the
+  override that supersedes it, so the test passed on a Mac (where `can.tier` IS `container`) and
+  failed on Linux (where it is `microvm`). A blanket fix applied to a test suite deserves a check for
+  the one test whose subject is the thing being blanket-fixed.
 - **Rebuild the agent and every layered image** after touching anything in `lib/` that the agent
   bundles. The in-sandbox half of a change otherwise silently does not exist.
