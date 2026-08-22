@@ -9,17 +9,27 @@
 // Read the negative-control test at the bottom first. It is the reason to trust the rest.
 
 const test = require('brittle')
-const os = require('bare-os')
+const path = require('bare-path')
 const env = require('bare-env')
 const h = require('./harness.js')
 
-const HOST_UID = typeof os.getuid === 'function' ? os.getuid() : 1000
-const HOST_USER = env.USER || 'ryan'
+const HOST_USER = env.USER || env.LOGNAME || 'nobody'
 const HOST_HOME = env.HOME || '/home/' + HOST_USER
+// The directory homes live in: /home on Linux, /Users on macOS. The probe below used a hardcoded
+// /home, which on a Mac is an empty autofs stub -- so "the host user's home is not visible" was true
+// no matter what the sandbox did. Derived from the real HOME so it means something on both.
+const HOME_PARENT = path.dirname(HOST_HOME)
+
+// Filled in from `podman info` before any probe runs -- see harness.serverFacts() for why this
+// cannot be os.getuid() (bare-os has no getuid, so the old code was always the literal 1000) and
+// cannot be this process's uid either (containers run on the podman SERVER, which on macOS is a VM).
+let SERVER_UID = null
+let SERVER_SOCK = null
 
 // Emits a flat report. Every probe is wrapped so a failure never aborts the script -- a missing
 // line would silently pass an `absent` assertion, so we always print something.
-const PROBE = `
+function PROBE() {
+  return `
 set +e
 say () { echo "$1=$2"; }
 
@@ -35,12 +45,12 @@ say canary_abs "$(cat ${HOST_HOME}/${h.CANARY_NAME} 2>/dev/null | head -1)"
 say canary_mount "$(cat /host/${h.CANARY_NAME} 2>/dev/null | head -1)"
 say canary_proc1 "$(cat /proc/1/root${HOST_HOME}/${h.CANARY_NAME} 2>/dev/null | head -1)"
 say host_home "$(test -d ${HOST_HOME} && echo present || echo absent)"
-say host_user_in_home "$(ls /home 2>/dev/null | grep -x '${HOST_USER}' || echo none)"
+say host_user_in_home "$(ls '${HOME_PARENT}' 2>/dev/null | grep -x '${HOST_USER}' || echo none)"
 say ssh_key "$(cat ${HOST_HOME}/.ssh/id_ed25519 2>/dev/null | head -1 | cut -c1-20)"
 say npmrc "$(cat ${HOST_HOME}/.npmrc 2>/dev/null | head -1 | cut -c1-20)"
 
 # --- sockets and devices -------------------------------------------------------------
-say podman_sock "$(test -S /run/user/${HOST_UID}/podman/podman.sock && echo present || echo absent)"
+say podman_sock "$(test -S '${SERVER_SOCK}' && echo present || echo absent)"
 say any_socket "$(find / -xdev -type s 2>/dev/null | head -3 | tr '\\n' ',')"
 say dev_kvm "$(test -e /dev/kvm && echo present || echo absent)"
 say dev_list "$(ls /dev 2>/dev/null | tr '\\n' ',')"
@@ -69,6 +79,7 @@ say pids_max "$(cat /sys/fs/cgroup/pids.max 2>/dev/null || echo unknown)"
 say nproc_lim "$(ulimit -u)"
 echo REPORT_END
 `
+}
 
 function parse(stdout) {
   const out = {}
@@ -97,6 +108,24 @@ test('escape suite: environment', async (t) => {
     t.pass('skipped')
     return
   }
+
+  // Ask podman who it is before building any probe. Getting this wrong does not fail loudly -- it
+  // makes the podman-socket probe test a path that cannot exist, which reads as "no socket
+  // reachable" and is indistinguishable from a correctly sealed sandbox.
+  const facts = await h.serverFacts()
+  SERVER_UID = facts.uid
+  SERVER_SOCK = facts.socket
+  t.ok(SERVER_UID, 'podman reported the server-side uid: ' + SERVER_UID)
+  t.ok(
+    SERVER_SOCK && SERVER_SOCK.startsWith('/'),
+    'and the real socket path to probe for: ' + SERVER_SOCK
+  )
+  // The probe asserts this socket is NOT reachable from inside. That only means something if the
+  // socket exists in the first place -- which is exactly what the old version got wrong: it built
+  // the path from a uid that was always the literal 1000, so it probed something that existed
+  // nowhere and "absent" was guaranteed.
+  t.ok(facts.socketExists, 'and podman confirms that socket exists server-side')
+
   t.pass('podman + image available; microvm=' + ENVP.microvm)
 })
 
@@ -113,7 +142,7 @@ for (const tier of ['container', 'microvm']) {
       return t.pass('skipped')
     }
 
-    const { res, r } = await reportFor(tier, () => h.runHardened(tier, ENVP.digest, PROBE))
+    const { res, r } = await reportFor(tier, () => h.runHardened(tier, ENVP.digest, PROBE()))
     t.is(res.code, 0, 'probe ran\n' + res.stderr.slice(0, 400))
 
     // The single most important assertion in the file: the canary must not appear ANYWHERE in
@@ -131,10 +160,17 @@ for (const tier of ['container', 'microvm']) {
   test(`hardened/${tier}: no sockets, no host devices`, async (t) => {
     if (!ENVP || !ENVP.ok) return t.pass('skipped')
     if (tier === 'microvm' && !ENVP.microvm) return t.pass('skipped')
-    const { r } = await reportFor(tier, () => h.runHardened(tier, ENVP.digest, PROBE))
+    const { r } = await reportFor(tier, () => h.runHardened(tier, ENVP.digest, PROBE()))
 
-    // Mounting this is instant root-equivalent on the host, and it exists on this machine.
-    t.is(r.podman_sock, 'absent', 'podman socket not reachable')
+    // Mounting this is instant root-equivalent on the host, and it exists on this machine -- the
+    // environment test above asserts podman confirms so, which is what stops this being a tautology.
+    //
+    // Honest limitation, measured rather than assumed: the negative control does NOT exercise this
+    // particular probe. Bind-mounting the socket directory into the weakened container still reports
+    // absent, because the intermediate /run/user/<uid> is 0700 and the container user cannot traverse
+    // it even when the host uid maps to container root. So "present" is currently unreachable in
+    // both postures, and it is `any_socket` below -- which does fire -- that carries the teeth here.
+    t.is(r.podman_sock, 'absent', 'podman socket not reachable at ' + SERVER_SOCK)
     t.is(r.any_socket, '', 'no unix sockets anywhere in the sandbox')
     // /dev/kvm is granted to the host-side VMM, never to the workload.
     t.is(r.dev_kvm, 'absent', 'kvm not exposed to the workload')
@@ -143,7 +179,7 @@ for (const tier of ['container', 'microvm']) {
   test(`hardened/${tier}: no network`, async (t) => {
     if (!ENVP || !ENVP.ok) return t.pass('skipped')
     if (tier === 'microvm' && !ENVP.microvm) return t.pass('skipped')
-    const { r } = await reportFor(tier, () => h.runHardened(tier, ENVP.digest, PROBE))
+    const { r } = await reportFor(tier, () => h.runHardened(tier, ENVP.digest, PROBE()))
 
     // No default route is the assertion that matters -- it is the absence of any egress path.
     t.is(r.default_route, '0', 'no default route')
@@ -173,7 +209,7 @@ for (const tier of ['container', 'microvm']) {
   test(`hardened/${tier}: rootfs immutable, workspace writable`, async (t) => {
     if (!ENVP || !ENVP.ok) return t.pass('skipped')
     if (tier === 'microvm' && !ENVP.microvm) return t.pass('skipped')
-    const { r } = await reportFor(tier, () => h.runHardened(tier, ENVP.digest, PROBE))
+    const { r } = await reportFor(tier, () => h.runHardened(tier, ENVP.digest, PROBE()))
     t.is(r.rootfs_write, 'readonly', '--read-only holds')
     t.is(r.tmp_write, 'ok', '/tmp is usable, or every real build breaks')
   })
@@ -190,7 +226,7 @@ for (const tier of ['container', 'microvm']) {
 
 test('hardened/container: capabilities are empty', async (t) => {
   if (!ENVP || !ENVP.ok) return t.pass('skipped')
-  const { r } = await reportFor('container', () => h.runHardened('container', ENVP.digest, PROBE))
+  const { r } = await reportFor('container', () => h.runHardened('container', ENVP.digest, PROBE()))
   t.is(r.uid, '1000', 'not container-root')
   t.is(r.capeff, '0000000000000000', 'no effective capabilities')
   t.is(
@@ -202,17 +238,17 @@ test('hardened/container: capabilities are empty', async (t) => {
 
 test('hardened/container: host uid is not mapped in', async (t) => {
   if (!ENVP || !ENVP.ok) return t.pass('skipped')
-  const { r } = await reportFor('container', () => h.runHardened('container', ENVP.digest, PROBE))
+  const { r } = await reportFor('container', () => h.runHardened('container', ENVP.digest, PROBE()))
   // --userns=auto deliberately omits the host uid, so even container-root owns nothing outside.
   t.absent(
-    r.uidmap.includes(`,${HOST_UID},`),
-    `host uid ${HOST_UID} absent from uid_map: ${r.uidmap}`
+    r.uidmap.includes(`,${SERVER_UID},`),
+    `server uid ${SERVER_UID} absent from uid_map: ${r.uidmap}`
   )
 })
 
 test('hardened/container: namespace + mount syscalls denied', async (t) => {
   if (!ENVP || !ENVP.ok) return t.pass('skipped')
-  const { r } = await reportFor('container', () => h.runHardened('container', ENVP.digest, PROBE))
+  const { r } = await reportFor('container', () => h.runHardened('container', ENVP.digest, PROBE()))
   t.ok(/not permitted|failed/i.test(r.unshare), 'unshare refused: ' + r.unshare)
   t.absent(r.unshare_caps.includes('ffffffffff'), 'no full-cap nested namespace: ' + r.unshare_caps)
   t.ok(/denied|permitted|must be superuser/i.test(r.mount_try), 'mount refused: ' + r.mount_try)
@@ -220,7 +256,7 @@ test('hardened/container: namespace + mount syscalls denied', async (t) => {
 
 test('hardened/container: pid limit is in force', async (t) => {
   if (!ENVP || !ENVP.ok) return t.pass('skipped')
-  const { r } = await reportFor('container', () => h.runHardened('container', ENVP.digest, PROBE))
+  const { r } = await reportFor('container', () => h.runHardened('container', ENVP.digest, PROBE()))
   t.is(r.pids_max, '512', 'cgroup pids.max matches --pids-limit')
   t.is(r.nproc_lim, '512', 'rlimit nproc is a second, independent fork brake')
 })
@@ -235,7 +271,7 @@ test('hardened/container: pid limit is in force', async (t) => {
 test('negative control: the weakened posture FAILS the host-safety probes', async (t) => {
   if (!ENVP || !ENVP.ok) return t.pass('skipped')
 
-  const res = await h.runWeakened(ENVP.digest, PROBE)
+  const res = await h.runWeakened(ENVP.digest, PROBE())
   if (res.code !== 0 && !res.stdout.includes('REPORT_END')) {
     t.comment('weakened posture could not start: ' + res.stderr.trim().split('\n')[0])
     t.comment('(pasta/keep-id may be unavailable here; the control is inconclusive)')
@@ -250,7 +286,7 @@ test('negative control: the weakened posture FAILS the host-safety probes', asyn
 
   // Privilege model wide open.
   t.not(r.capeff, '0000000000000000', 'weakened posture keeps capabilities: ' + r.capeff)
-  t.ok(r.uidmap.includes(`,${HOST_UID},`), 'keep-id maps the host uid straight in: ' + r.uidmap)
+  t.ok(r.uidmap.includes(`,${SERVER_UID},`), 'keep-id maps the server uid straight in: ' + r.uidmap)
 
   // Network reachable. This assertion is also what proves the hardened route probe is real
   // rather than vacuous -- an earlier version used `ip route`, which is not installed in this

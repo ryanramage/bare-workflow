@@ -15,7 +15,55 @@ podman build -f etc/Containerfile.pear       -t localhost/bare-workflow-pear:dev
 npm test
 npm run lint
 npm run build:rpc   # regenerate schema/spec from schema/builder (committed output)
+npm run build:seccomp   # regenerate etc/seccomp/build-v1.json from the pinned base
 ```
+
+### The seccomp profile is generated from a PINNED base
+
+`etc/seccomp/build-v1.json` is produced by hardening the container host's `containers-common`
+profile — and that input differs between distros in ways that are not cosmetic. Measured across 448
+syscalls, an Arch host and the Fedora CoreOS guest in a macOS podman machine disagree on 6: the Arch
+base denies `socket(AF_VSOCK)` (the host↔guest channel) and the CoreOS one does not, and CoreOS omits
+the `futex_*` family so it would fall through to a default EPERM — the same class of breakage as the
+`clone3 → ENOSYS` bug the tests were written around.
+
+So the base is committed as `etc/seccomp/base-v1.json` and the generator reads that, not your
+machine. The drift guard in `test/seccomp.js` compares against the pin, which makes it mean "someone
+changed the generator without regenerating" rather than "you are on a different distro".
+
+```bash
+bare scripts/build/seccomp.js            # regenerate the profile from the pinned base
+bare scripts/build/seccomp.js --check    # exit 1 if the committed profile is stale
+bare scripts/build/seccomp.js --capture  # adopt a NEW upstream base -- review this diff carefully
+```
+
+`bare-build` must be on PATH (`npm i -g bare-build`) — it is what produces the agent binary. If it is
+missing the build now says so; it used to exit 144 with no output at all.
+
+### On macOS
+
+Everything above works, with three setup facts that are easy to get wrong and only one of which fails
+loudly on its own.
+
+```bash
+podman machine set --memory 8192 --cpus 6   # resizes IN PLACE -- no need to destroy the machine
+podman machine start
+```
+
+1. **Give the machine enough RAM.** The shipped limits want an 8 GiB memory cap plus a 4 GiB `/w`
+   tmpfs, and tmpfs is charged to the memory cgroup. A 2 GiB machine cannot honour that, and nothing
+   checks: you get an OOM-killed VM presenting as `podman exited <n>`.
+2. **Keep the checkout under `/Users` or `/private`.** The seccomp profile is an absolute _host_ path
+   read by the podman service _inside_ the VM. podman machine mounts those two via virtiofs, so a
+   normal clone resolves. `/Volumes` is not mounted and fails with `opening seccomp profile failed`
+   naming a path that plainly exists on your Mac — the launcher now explains that when it happens.
+3. **`--tier container` is required for every `run`.** `minTier` defaults to `microvm`, and krun is
+   permanently unreachable on macOS: applehv guests get no `/dev/kvm`, and nested virtualisation needs
+   M3+ and is not exposed by podman machine. So a default `run` correctly exits 78. See CLAUDE.md for
+   the open question of what that shared-VM posture should be called.
+
+The agent is cross-built for the podman **server**'s architecture, not this host's, so on Apple
+Silicon you get an arm64 agent automatically. `bare bin.js doctor` reports all of it.
 
 ### Building the images
 

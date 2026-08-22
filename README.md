@@ -3,8 +3,8 @@
 Build your Pear app for every platform, from one machine, in a sandbox — on [Bare](https://github.com/holepunchto/bare).
 
 > [!NOTE]
-> Experimental and early; 1.0.0 will signal stability. Linux host only for now — see
-> [Platform support](#platform-support).
+> Experimental and early; 1.0.0 will signal stability. Linux and macOS hosts; `darwin-arm64` still
+> needs a Mac-native tier — see [Platform support](#platform-support).
 
 Point it at a [hello-pear-bare](https://github.com/holepunchto/hello-pear-bare) project and it
 cross-builds **five of the six desktop distributables from a single Linux machine**, assembles the
@@ -27,10 +27,17 @@ rather than silently produced; [see below](#why-darwin-arm64-needs-a-mac).
 
 ## Requirements
 
-- **Linux**, x64 or arm64
+- **Linux** (x64 or arm64), or **macOS** (Apple Silicon or Intel)
 - [**Bare**](https://github.com/holepunchto/bare) — `npm i -g bare-runtime`
-- **podman**, rootless is fine — `sudo pacman -S podman` / `sudo apt install podman`
-- **libkrun**, for the microVM tier — `sudo pacman -S libkrun libkrunfw`
+- **podman**, rootless is fine — `sudo pacman -S podman` / `sudo apt install podman` /
+  `brew install podman`
+- **libkrun**, for the microVM tier — `sudo pacman -S libkrun libkrunfw`. **Linux only**: krun needs
+  `/dev/kvm`, which a macOS podman machine does not provide. On macOS the container tier is the
+  strongest available, so runs need an explicit `--tier container`.
+
+On macOS, `podman machine` must be started and given enough memory for the default limits
+(`podman machine set --memory 8192`), and the checkout has to live somewhere the machine mounts —
+`/Users` or `/private`, not `/Volumes`. See [DEVELOPMENT.md](DEVELOPMENT.md) for the details.
 
 Check your machine before anything else:
 
@@ -396,17 +403,19 @@ The full argument list, what each flag buys, and the escape suite that proves it
 
 ## Platform support
 
-| Host            | Status                                                                             |
-| --------------- | ---------------------------------------------------------------------------------- |
-| **linux-x64**   | supported and tested                                                               |
-| **linux-arm64** | expected to work; not yet exercised                                                |
-| **darwin**      | **in progress** — the next target, and the only host that can sign `darwin-arm64`  |
-| **win32**       | **not yet** — known gaps documented in [CLAUDE.md](CLAUDE.md#windows-host-support) |
+| Host             | Status                                                                                 |
+| ---------------- | -------------------------------------------------------------------------------------- |
+| **linux-x64**    | supported and tested                                                                   |
+| **linux-arm64**  | expected to work; not yet exercised                                                    |
+| **darwin-arm64** | supported and tested as a HOST — runs the full suite and cross-builds all five targets |
+| **darwin-x64**   | expected to work as a host; not yet exercised                                          |
+| **win32**        | **not yet** — known gaps documented in [CLAUDE.md](CLAUDE.md#windows-host-support)     |
 
-macOS is the priority because it closes the one gap a Linux runner cannot: a Mac is the only machine
-that can sign a `darwin-arm64` binary. Encouragingly that needs only an **ad-hoc** signature
-(`codesign --sign -`, from the Xcode Command Line Tools) — no certificate and no Apple ID. What it
-does need is a darwin _execution_ tier, because a Linux container on a Mac still cannot sign. The
+A Mac now works as a host: it runs the whole suite and cross-builds the same five targets a Linux
+box does, in a Linux guest inside `podman machine`. What it does **not** yet do is the one thing only
+a Mac can — produce `darwin-arm64`. That needs a darwin _execution_ tier, because a Linux container
+on a Mac still cannot sign. Encouragingly the signature required is only an **ad-hoc** one
+(`codesign --sign -`, from the Xcode Command Line Tools) — no certificate and no Apple ID. The
 groundwork and the open design questions are in [CLAUDE.md](CLAUDE.md#macos-host-support).
 
 The farm itself — routing `darwin-arm64` to a Mac peer over hyperdht — is designed for but not

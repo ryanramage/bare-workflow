@@ -55,6 +55,7 @@
   },
   "scripts": {
     "build:rpc": "bare scripts/build/rpc.js && prettier --write schema/spec",
+    "build:seccomp": "bare scripts/build/seccomp.js",
     "format": "prettier --write . && lunte --fix lib test schema/builder scripts",
     "lint": "prettier --check . && lunte lib test schema/builder scripts",
     "test": "brittle-bare test/index.js"

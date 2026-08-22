@@ -10,7 +10,8 @@
 
 const { spawnSync } = require('bare-subprocess')
 const path = require('bare-path')
-const env = require('bare-env')
+const os = require('bare-os')
+const { hostEnv, which } = require('../../lib/host-env.js')
 
 const { LocalLauncher } = require('./local-launcher.js')
 const { create: podmanLauncher } = require('../../lib/isolation/podman/launcher.js')
@@ -21,19 +22,25 @@ const PROFILE = path.resolve('etc/seccomp/build-v1.json')
 
 // Synchronous on purpose: CJS has no top-level await, and making available() async would force
 // every consumer to register its tests from inside a callback. The probe runs once per process.
-function sh(file, args, timeoutMs = 120000) {
+//
+// The `timeoutMs` argument this used to take was passed to spawnSync as `timeout`, an option
+// bare-subprocess does not implement -- inert since the day it was written. It is gone rather than
+// left looking like a guard. The `which` check is load bearing: spawning an absent binary throws
+// ENOENT and then makes bare exit 144 at teardown even when the throw is caught.
+function sh(file, args) {
+  if (which(file) === null) {
+    return { code: -1, stdout: '', stderr: `${file} not found on PATH`, missing: true }
+  }
   try {
-    const r = spawnSync(file, args, {
-      timeout: timeoutMs,
-      env: { PATH: env.PATH, HOME: env.HOME, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR }
-    })
+    const r = spawnSync(file, args, { env: hostEnv() })
     return {
       code: r.status === null ? -1 : r.status,
       stdout: r.stdout ? r.stdout.toString() : '',
-      stderr: r.stderr ? r.stderr.toString() : ''
+      stderr: r.stderr ? r.stderr.toString() : '',
+      missing: false
     }
   } catch (err) {
-    return { code: -1, stdout: '', stderr: String(err) }
+    return { code: -1, stdout: '', stderr: String(err), missing: false }
   }
 }
 
@@ -51,22 +58,35 @@ function available() {
       name: 'local',
       isolated: false,
       make: () => new LocalLauncher(),
+      // This one runs on the host, so unlike every isolated tier its platform is the host's.
+      expectPlatform: os.platform(),
       // The host has no /w, so steps need a cwd that exists here.
-      cwd: '/tmp'
+      cwd: os.tmpdir ? os.tmpdir() : '/tmp'
     }
   ]
 
-  const v = sh('podman', ['version', '--format', '{{.Client.Version}}'], 20000)
+  // `info` asks the server, which is the thing that has to work. `version` succeeds against a
+  // client whose machine is stopped on Linux and fails opaquely everywhere else; on macOS a stopped
+  // machine is the normal state of a correct install, so "podman unavailable" was the single most
+  // misleading string in the suite.
+  const v = sh('podman', ['info', '--format', '{{.Version.Version}}'])
   if (v.code !== 0) {
-    cached = { launchers: out, reason: 'podman unavailable' }
+    cached = {
+      launchers: out,
+      reason: v.missing
+        ? 'podman not found on PATH'
+        : 'podman did not answer: ' + (v.stderr.trim().split('\n')[0] || `exit ${v.code}`)
+    }
     return cached
   }
 
-  const d = sh(
-    'podman',
-    ['image', 'inspect', `${IMAGE_REF}:${IMAGE_TAG}`, '--format', '{{.Digest}}'],
-    30000
-  )
+  const d = sh('podman', [
+    'image',
+    'inspect',
+    `${IMAGE_REF}:${IMAGE_TAG}`,
+    '--format',
+    '{{.Digest}}'
+  ])
   if (d.code !== 0) {
     cached = {
       launchers: out,
@@ -96,27 +116,23 @@ function available() {
 
   // Does krun actually work right now? Cheaper to ask once than to have every microvm test fail
   // identically.
-  const k = sh(
-    'podman',
-    [
-      'run',
-      '--rm',
-      '--annotation',
-      'run.oci.handler=krun',
-      '--device',
-      '/dev/kvm',
-      '--network',
-      'none',
-      '--log-driver',
-      'none',
-      '--entrypoint',
-      '/bin/sh',
-      `${IMAGE_REF}@${digest}`,
-      '-c',
-      'true'
-    ],
-    120000
-  )
+  const k = sh('podman', [
+    'run',
+    '--rm',
+    '--annotation',
+    'run.oci.handler=krun',
+    '--device',
+    '/dev/kvm',
+    '--network',
+    'none',
+    '--log-driver',
+    'none',
+    '--entrypoint',
+    '/bin/sh',
+    `${IMAGE_REF}@${digest}`,
+    '-c',
+    'true'
+  ])
 
   if (k.code === 0) {
     out.push({

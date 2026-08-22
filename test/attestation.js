@@ -8,6 +8,7 @@
 // failed task -- the run you most want to inspect is the one that went wrong.
 
 const test = require('brittle')
+const os = require('bare-os')
 const fs = require('bare-fs')
 const attestation = require('../lib/attestation.js')
 
@@ -136,7 +137,11 @@ test('the record captures task, host, source and step facts', (t) => {
   t.is(record.task.toolchain, 'pear', 'which toolchain, because that is which image')
   t.is(record.status, 'success')
 
-  t.is(record.host.platform, 'linux')
+  // The HOST platform, which is whatever this machine is -- not hardcoded 'linux'. The interesting
+  // assertion is the one in the test below: execPlatform stays 'linux' on a Mac, because a container
+  // is a Linux guest whatever the host is. Conflating the two is the bug lib/targets.js exists to
+  // prevent, so this must not be pinned to one platform.
+  t.is(record.host.platform, os.platform())
   t.is(record.host.podman, '6.1.0')
   t.ok(record.host.bare, 'the runtime version is pinned too')
 

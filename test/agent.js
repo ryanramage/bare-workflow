@@ -12,6 +12,7 @@
 
 const test = require('brittle')
 const fs = require('bare-fs')
+const os = require('bare-os')
 const { create: sandbox, onAbort } = require('../lib/sandbox.js')
 const { LocalLauncher } = require('./support/local-launcher.js')
 const agent = require('../lib/agent/index.js')
@@ -38,17 +39,37 @@ test('resolveShell finds a shell without an inherited PATH', (t) => {
   )
 })
 
-test('strayFds ignores runtime plumbing but catches a real leak', (t) => {
+test('the fd scan says whether it could run, not just what it found', (t) => {
+  // The bug this pins: `strayFds()` caught the procfs read error and returned `[]`, so on a platform
+  // without /proc the leak detector reported clean for every process. It passed on macOS while
+  // measuring nothing -- and so did the assertion below whose entire job is to catch a leak.
+  const scan = agent.scanFds()
+  t.ok(typeof scan.status === 'string' && scan.status.length > 0, 'status: ' + scan.status)
+  t.alike(scan.fds, [], 'a clean process reports no strays')
+
+  if (scan.status !== agent.FD_SCAN_OK) {
+    // Deliberately not a pass dressed up as a skip: state which platform, and that the detector is
+    // inert here rather than satisfied.
+    t.comment(`fd scanning is unavailable on ${os.platform()}: ${scan.status}`)
+    t.comment('the leak assertion below cannot run; it is not being reported as passing')
+    return
+  }
+
   // Both halves matter. "Any fd above 2" would fire on the Bare runtime's own dozen descriptors
   // (eventpoll, io_uring, eventfd, pipes) and get ignored; a check that never fires is equally
   // useless. So: clean process reports nothing, and a real host handle is caught.
-  t.alike(agent.strayFds(), [], 'clean process reports nothing')
+  //
+  // The file only has to exist and be outside the allowed prefixes. It used to be /etc/hostname,
+  // which does not exist on macOS -- and because this is a sync test, the ENOENT propagated out of
+  // brittle as an unhandled rejection and killed the whole run at test 165 of ~290.
+  const host = ['/etc/hostname', '/etc/hosts', '/etc/passwd'].find((f) => fs.existsSync(f))
+  t.ok(host, 'found a host file to open: ' + host)
 
-  const fd = fs.openSync('/etc/hostname', 'r')
+  const fd = fs.openSync(host, 'r')
   try {
     const stray = agent.strayFds()
     t.is(stray.length, 1, 'an inherited host-file handle is caught')
-    t.ok(stray[0].endsWith(':/etc/hostname'), 'and named: ' + stray[0])
+    t.ok(stray[0].endsWith(':' + host), 'and named: ' + stray[0])
   } finally {
     fs.closeSync(fd)
   }

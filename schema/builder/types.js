@@ -54,7 +54,15 @@ module.exports = function generateTypes(schema) {
       // dies with "this._handlers[command] is not a function" and the driver sees only a crashed
       // container. In a farm where peers run different image versions, that is a routine situation,
       // so agents advertise their surface and the driver checks before it calls.
-      { name: 'commands', type: 'string', array: true }
+      { name: 'commands', type: 'string', array: true },
+      // Whether the fd scan above could actually RUN, as distinct from what it found.
+      //
+      // strayFds enumerates /proc/self/fd. Where there is no procfs the old code caught the error
+      // and returned an empty list, so "I looked and found nothing" and "I could not look" were the
+      // same value on the wire -- a security control reporting clean while measuring nothing. That
+      // is exactly what decision 4 exists to forbid, and it is invisible on Linux, which is why it
+      // survived. 'ok' means the scan ran; anything else is the reason it did not.
+      { name: 'fdScan', type: 'string' }
     ]
   })
 

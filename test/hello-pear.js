@@ -11,13 +11,14 @@ const test = require('brittle')
 const { spawn } = require('bare-subprocess')
 const fs = require('bare-fs')
 const path = require('bare-path')
-const env = require('bare-env')
+const { hostEnv } = require('../lib/host-env.js')
 
 const detect = require('../lib/isolation/detect.js')
 const toolchains = require('../lib/toolchains.js')
 const targets = require('../lib/targets.js')
 const { localStore } = require('../lib/store')
 const dht = require('./support/dht.js')
+const { need, runId: runIdOf } = require('./support/need.js')
 
 const ROOT = path.join(__dirname, '..')
 const BIN = path.join(ROOT, 'bin.js')
@@ -27,7 +28,7 @@ function cli(args, timeoutMs = 1800000) {
     const proc = spawn(Bare.argv[0], [BIN, ...args], {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { PATH: env.PATH, HOME: env.HOME, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR }
+      env: hostEnv()
     })
     let stdout = ''
     let stderr = ''
@@ -53,7 +54,7 @@ function fileType(target) {
   return new Promise((resolve) => {
     const proc = spawn('file', ['-b', target], {
       stdio: ['ignore', 'pipe', 'ignore'],
-      env: { PATH: env.PATH }
+      env: hostEnv()
     })
     let out = ''
     proc.stdout.on('data', (c) => {
@@ -67,8 +68,11 @@ function fileType(target) {
 // Skip cleanly unless this machine can actually run the toolchain.
 function ready() {
   try {
-    detect.resolve({ min: 'container', image: toolchains.resolve('bare-build').image })
-    return { ok: true }
+    // The tier is returned, not just discarded: every `cli(['run', ...])` below has to pass it
+    // explicitly, because the CLI's own default minimum is microvm and that is permanently
+    // unavailable on macOS. Without it the run exits 78 before doing anything this file asserts on.
+    const r = detect.resolve({ min: 'container', image: toolchains.resolve('bare-build').image })
+    return { ok: true, tier: r.tier }
   } catch (err) {
     return { ok: false, why: err.message.split('\n')[0] }
   }
@@ -122,6 +126,16 @@ test('the project asserts its own name survives bare-build', (t) => {
 test('the upgrade link is asserted, never written', { timeout: 300000 }, async (t) => {
   // The link is compiled into the binary, so a mismatch means the distributable cannot receive
   // updates from the intended release line. Assert before anything runs.
+  //
+  // "Before anything runs" still means the run has to GET that far: with no usable tier the CLI
+  // exits 78 at tier detection and never reaches the upgrade assertion, so this has to skip rather
+  // than report a mismatch it never checked.
+  const can = ready()
+  if (!can.ok) {
+    t.comment('skipping: ' + can.why)
+    return t.pass('skipped')
+  }
+
   const src = path.join(ROOT, 'examples/hello-pear/package.json')
   const before = fs.readFileSync(src, 'utf8')
   const tmpf = path.join(ROOT, 'examples/.test-mismatch.yml')
@@ -135,7 +149,7 @@ test('the upgrade link is asserted, never written', { timeout: 300000 }, async (
     )
   )
   try {
-    const r = await cli(['run', 'examples/.test-mismatch.yml'], 300000)
+    const r = await cli(['run', 'examples/.test-mismatch.yml', '--tier', can.tier], 300000)
     t.is(r.code, 1, 'a mismatch fails the run')
     const blob = r.stdout + r.stderr
     t.ok(/upgrade link mismatch/.test(blob))
@@ -187,6 +201,8 @@ test(
         'run',
         'examples/hello-pear.yml',
         '--json',
+        '--tier',
+        can.tier,
         '--concurrency',
         '2',
         '--state',
@@ -230,19 +246,28 @@ test(
       t.ok(produced.includes('deployment'), 'and the assembled deployment folder')
 
       // The real assertion: each binary is genuinely for its target.
-      const runId = fs.readdirSync(state + '/runs')[0]
+      const runId = runIdOf(t, fs, state)
+      if (!runId) return
       const store = localStore({ root: state + '/artifacts', runId })
       const expected = {
-        'linux-x64': /^ELF .*x86-64/,
-        'linux-arm64': /^ELF .*aarch64/,
-        'win32-x64': /^PE32\+ .*x86-64/,
-        'win32-arm64': /^PE32\+ .*ARM64/,
-        'darwin-x64': /^Mach-O .*x86_64/
+        // Case-insensitive, and the aarch64/ARM64 spellings are both accepted, because file(1)
+        // does not agree with itself across platforms: for the same win32-arm64 binary Linux's
+        // file says "PE32+ executable (console) ARM64" and macOS's says "... Aarch64". Pinning one
+        // spelling made this fail on a Mac while the binary was perfectly correct -- a property of
+        // the test host leaking into an assertion about the artifact.
+        'linux-x64': /^ELF .*x86-64/i,
+        'linux-arm64': /^ELF .*aarch64/i,
+        'win32-x64': /^PE32\+ .*x86-64/i,
+        'win32-arm64': /^PE32\+ .*(ARM64|Aarch64)/i,
+        'darwin-x64': /^Mach-O .*x86_64/i
       }
       for (const [target, pattern] of Object.entries(expected)) {
         const dir = path.join(out, target)
         await store.get('dist-' + target, dir)
-        const binary = path.join(dir, fs.readdirSync(dir)[0])
+        const names = fs.readdirSync(dir)
+        t.ok(names.length > 0, target + ' produced a file')
+        if (!names.length) continue
+        const binary = path.join(dir, names[0])
         const type = await fileType(binary)
         if (type === null) {
           t.comment('file(1) unavailable; falling back to magic bytes')
@@ -299,16 +324,17 @@ test(
       // Stage 3: the publish. This is the end of the line the docs describe -- make distributables,
       // build the deployment directory, stage -- so the assertion is that a real `pear://` link came
       // out of it, and that the record binds that link to the exact bytes that were published.
-      const published = evs.find((e) => e.cmd === 'publish' && e.tag === 'done')
-      t.ok(published, 'the publish job ran')
-      t.ok(
-        /^pear:\/\/[a-z0-9]{52}$/.test(published.data.link),
-        'a real link: ' + published.data.link
-      )
-      t.is(published.data.live, !!net, 'live only when this machine had a network and --publish')
+      // need(), not a bare find(): `t.ok(published)` records a failure but does NOT stop the test,
+      // so the next line dereferenced undefined and took the whole suite down with an uncaught
+      // TypeError. Seen for real -- this test passes in isolation but had not run its publish job
+      // during one full-suite run, and the crash hid every test after it.
+      const published = need(t, evs, (e) => e.cmd === 'publish' && e.tag === 'done', 'publish/done')
+      const pub = published.data || {}
+      t.ok(/^pear:\/\/[a-z0-9]{52}$/.test(pub.link || ''), 'a real link: ' + pub.link)
+      t.is(pub.live, !!net, 'live only when this machine had a network and --publish')
       if (net) {
-        t.is(published.data.link, net.link, 'and it is the drive the seeder was watching')
-        t.ok(published.data.snapshot.after.length > 0, 'the snapshot moved forward')
+        t.is(pub.link, net.link, 'and it is the drive the seeder was watching')
+        t.ok(pub.snapshot && pub.snapshot.after.length > 0, 'the snapshot moved forward')
       }
 
       const record = JSON.parse(

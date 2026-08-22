@@ -203,6 +203,137 @@ It **errors** rather than falling back to its permissive default. So a bad profi
 blocker, not a silent security regression. (A code audit flagged this as possibly the most dangerous
 Windows finding; measurement says otherwise.)
 
+### The first real macOS run: what only running it could find
+
+Everything in this block was established on an Apple Silicon Mac (M1 Pro, Darwin 23.6.0, podman
+5.4.2 applehv). The preceding commit ("macos prep") predicted macOS problems _from a Linux box_ and
+got the reasonable ones right. These are the ones that needed hardware.
+
+**An `undefined` env value is passed to the child as the literal string `"undefined"`.**
+`bare-subprocess` builds the child environment with `` `${key}=${value}` `` over `Object.entries`.
+`XDG_RUNTIME_DIR` is unset on macOS, so seven sites of the shape
+`{ PATH: env.PATH, HOME: env.HOME, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR }` shipped
+`XDG_RUNTIME_DIR=undefined` and podman died before doing anything:
+`Failed to obtain podman configuration: lstat undefined: no such file or directory`. This is a
+**diagnosis trap**: podman worked perfectly, and `doctor` said "podman not found — install podman".
+Allowlists are now built by _copying keys that are set_ (`lib/host-env.js`), never by naming them as
+object literal properties, and the invariant "no value is the string `undefined`" is asserted.
+
+**`podman version` cannot distinguish "not installed" from "machine stopped".** It exits 125 with
+"Cannot connect to Podman" when the VM is down — which on macOS is the normal state of a correct
+install. `detect.probe()` reported that as "podman not found". It now uses `podman info` (server-side
+facts, as the roadmap already specified) and separates _missing_ / _not reachable_ / _misconfigured_,
+each with a remediation that can actually be typed.
+
+**`spawnSync` has no `timeout` option in `bare-subprocess`.** The word does not appear in the module.
+`detect.js` passed `timeout: 30000` and it was inert on every platform, always had been. Removed
+rather than left looking like a guard; there is no way to bound a _synchronous_ spawn from inside the
+process, so a stalling podman would still hang. Not yet observed — do not build a watchdog for it
+until it is.
+
+**A caught missing-binary spawn still makes bare exit 144.** `spawn()` of an absent program throws
+ENOENT, and even when that throw is caught the process exits 144 at teardown. So one spawn of a
+binary that is not installed turns a fully green suite into a non-zero exit — and the thrown error
+carries **no program name** (`no such file or directory`), which is also why the systemd-scope skip
+guard, which matched on stderr text, missed and failed loudly instead. The rule now: look with
+`which()` before spawning anything that might be absent. This is also why `bare scripts/build/agent.js`
+exited 144 with no output at all when `bare-build` was not installed.
+
+**`bare-os` has no `getuid`, so the escape suite's uid was always the literal 1000.**
+`test/escape/index.js` computed `typeof os.getuid === 'function' ? os.getuid() : 1000`. The fallback
+was always taken. Two consequences, and the second is the serious one:
+
+- The negative control's `uid_map` assertion looked for a uid that is never mapped. That is how this
+  was found — it failed on the Mac.
+- The `podman_sock` probe tested `/run/user/1000/podman/podman.sock`, a path that exists only if your
+  uid happens to be 1000. It reported `absent` in **both** postures, so the negative control never
+  contradicted it — on _any_ machine with a different uid, Linux included. That is the `ip route`
+  failure mode, on the probe that matters most, and it was never macOS-specific.
+
+The uid and the socket path now come from `podman info` (`host.idMappings.uidmap`,
+`host.remoteSocket`) — the machine where containers actually run, which on macOS is the VM's `core`
+user (503 here), not this process. The environment test additionally asserts podman says the socket
+_exists_, so "absent inside" is a measurement rather than a tautology. Honest remaining gap, measured:
+bind-mounting the socket directory into the weakened container still reports absent, because
+`/run/user/<uid>` is 0700 and the container user cannot traverse it even as container-root. So this
+probe has no negative control; `any_socket` is what carries the teeth.
+
+**`statfsSync('/home')` reports zero blocks on macOS.** `/home` is an autofs trigger (`map auto_home`).
+The disk-exhaustion control computed a delta of 0 and its `< 64 MiB` assertion was trivially true. It
+now picks a filesystem that reports real block counts and **fails** if none does. Verified live: a
+200 MiB write moves the delta by exactly 209715200 bytes.
+
+**`strayFds()` reported "clean" on any platform without procfs.** It enumerated `/proc/self/fd`
+behind `catch {}` and returned `[]`, so "I looked and found nothing" and "I could not look" were the
+same value — a security control that degrades to always-pass, which decision 4 exists to forbid. The
+hello frame now carries `fdScan` (v5, append-only) saying whether the scan ran. Isolated tiers must
+report `ok`; only the test-only local launcher may say it is inert, and it says so out loud.
+
+**`file(1)` does not agree with itself across platforms.** For the same win32-arm64 binary Linux
+prints `PE32+ executable (console) ARM64` and macOS prints `... Aarch64`. Pinning one spelling made
+the cross-build test fail on a Mac while the artifact was perfectly correct.
+
+**Two example lockfiles were gitignored, and both examples require them.** A blanket
+`package-lock.json` rule excluded `examples/project/` and `examples/hello-pear/` — but
+`examples/offline.yml` prefetches from the lockfile with no network, and its own comment says "the
+committed lockfile". They worked on the machine they were written on because a stray `npm install`
+had left them behind, and failed on the first fresh clone. Now explicitly un-ignored.
+
+**The CLI reported an environment problem for a command-line typo.** Tier detection ran before graph
+expansion, so a misspelled `--job` on a machine with no usable tier said "no isolation tier meeting
+minimum 'microvm' is available" and exit 78. Static, host-independent checks (job selection, cycles,
+`--env` parsing) now run first; the tier is still resolved before anything touches podman or runs a
+step.
+
+**The seccomp base profile is not the same file on every machine, and the differences bite.** The
+generator hardens the container host's `containers-common` profile. Comparing an Arch host's base
+against the Fedora CoreOS guest inside a macOS podman machine — 448 syscalls — **6 disagree**:
+
+- `socket` with arg0 == 40 (**AF_VSOCK**) is denied via the Arch base and simply absent from the
+  CoreOS one. AF_VSOCK is the host↔guest channel. Regenerating the profile on a Mac would have
+  dropped that restriction silently.
+- `futex_wait`, `futex_wake`, `futex_requeue`, `futex_waitv` and `fanotify_init` are allowed by the
+  Arch base and unlisted in the CoreOS one, so they would fall through to the default `ERRNO`.
+  Denying the futex family with EPERM is the same hazard as the `clone3 → ENOSYS` case this
+  generator's tests were written around — it breaks threading and presents as "npm hangs forever".
+
+So "run the generator and commit the result" was only reproducible on the maintainer's distro, and
+the drift guard was really testing which OS you were on. The base is now a **committed pin**
+(`etc/seccomp/base-v1.json`) with `scripts/build/seccomp.js` to regenerate from it, `--check` to
+detect staleness, and `--capture` as the deliberate, reviewable act of adopting a new upstream base.
+The drift guard compares against the pin; a separate test still asserts the _live_ base has the
+weakness the generator exists to fix, and that one now works on macOS by reading the base out of the
+podman machine.
+
+Note the committed profile itself was **not** regenerated — it is correct, and the escape suite plus
+the new arch test confirm it denies what it should on arm64. **The pin still needs capturing on the
+Linux box that produced it** (`bare scripts/build/seccomp.js --capture`); until then the drift guard
+skips and says so.
+
+#### Answers to the macOS blockers, now measured
+
+- **Blocker 1 (agent architecture) is closed.** `scripts/build/agent.js` read `arm64` from the podman
+  server, cross-built an `ELF ARM aarch64` agent, and it executes in the guest. No `exec format
+error`, no exit 126.
+- **Blocker 3 (seccomp path) is real but much narrower than expected.** podman machine mounts **both
+  `/Users` and `/private`** via virtiofs, so a checkout under either resolves in the guest — measured
+  from `/private/tmp` as well as from `$HOME`. `/Volumes` is _not_ mounted and fails with
+  `Error: opening seccomp profile failed: ... no such file or directory`. So it fails **closed and
+  loudly**, consistent with the Linux measurement. The launcher now explains that error instead of
+  naming a host path that plainly exists.
+- **Blocker 4 (x86-only seccomp architectures) is NOT a hole.** Measured by isolating seccomp from
+  `--cap-drop`: with **full capabilities** and the profile, `unshare` returns EPERM and `mount` fails;
+  with full capabilities and `seccomp=unconfined`, both succeed. So the filter applies on aarch64
+  even though the profile declares only `SCMP_ARCH_X86_64/X86/X32` — `seccomp_init()` installs the
+  native arch and `architectures` only ADDS to it. The x86-only syscall _names_ (`modify_ldt`,
+  `iopl`, `ioperm`, `arch_prctl`) do not stop the container starting: ordinary tools still run. This
+  is now a regression test with its own built-in control, in `test/argv-runs.js`.
+- **Blocker 2 (every default `run` exits 78) still holds, and is now correct.** `minTier` defaults to
+  microvm, krun is permanently unreachable on macOS, so `--tier container` is required. What changed
+  is that it is reached for the right reason and says so. Note the consequence for tests: any test
+  asserting exit 78 for some _other_ cause must pass `--tier` explicitly, or it passes for the wrong
+  reason.
+
 ### Other findings not worth relearning
 
 - Under krun the guest has full capabilities **by design** — the VM is the boundary. Escape assertions
@@ -359,22 +490,32 @@ and whether crun skips or errors determines if the container starts at all.
 
 #### Still to do, in order
 
-1. **Agent/image architecture end to end on the Mac** — the build script is fixed, but nothing has run
-   on Apple Silicon. This is the gate: nothing else is observable until a container starts.
-2. **The `/run/user/$UID/podman/podman.sock` escape probe** (`test/escape/index.js`). On macOS the
-   socket lives under `$HOME/.local/share/containers/podman/machine/<name>/`, so this probe reports
-   `absent` in _both_ postures — the `ip route` failure mode again, and this is the probe that matters
-   most, since a reachable podman socket is root-equivalent. The generic `any_socket` probe still has
-   teeth; the specific one does not.
-3. **`detect.js` via `podman info`**, plus the shared-VM tier decision above.
-4. **The seccomp path** (blocker 3), and measure whether the `$HOME` mount masks it.
+Items 1, 2, 3, 4 and 6 of this list are **done** — see "The first real macOS run" above for what each
+one actually turned out to be. The state now: the whole suite runs on macOS and the container tier is
+real. `hello-pear-bare` cross-builds all five buildable desktop targets from this Mac, in a Linux
+guest, and stages to a `pear://` link.
+
+What remains:
+
+1. **The shared-VM tier decision.** Still open, still yours. `detect.js` probes via `podman info` now
+   and tells the truth ("krun is Linux-only ... the podman-machine VM is a host boundary but is SHARED
+   between jobs"), but that posture has no name and no rank of its own. Until it gets one, macOS users
+   must pass `--tier container` for every run, which is honest but repetitive.
+2. **The macOS setup story.** Three things must be true and none are checked as a set: the machine
+   needs enough RAM for the default limits (the shipped defaults want 8 GiB, and `podman machine set
+--memory` resizes in place — no need to recreate), the checkout must live somewhere the VM mounts
+   (`/Users` or `/private`, not `/Volumes`), and `bare-build` must be on PATH. `doctor` could check
+   all three.
+3. **Rosetta is still enabled in the machine** (`/var/mnt rosetta virtiofs` inside the guest). Decision
+   2 forbids emulation, and `podman machine set` has no `--rosetta` flag — only a fresh `init` can turn
+   it off. It is not currently reachable by a build (the agent and images are all native arm64), but it
+   is a live x86-64 emulation path sitting inside the sandbox host, and it would let a wrong-arch agent
+   silently work rather than failing the way the arch guard intends.
+4. **`resolveLimits()` never checks the machine's real capacity.** It validates the tmpfs sizes against
+   each other but not against `podman info`'s `MemTotal`, so a `--memory` cap above the VM's physical
+   RAM is no cap at all and filling `/w` OOMs the VM rather than the job. This is a server-side fact
+   nothing reads.
 5. **Then the actual goal:** a darwin execution tier, so `darwin-arm64` can be built. See below.
-6. **Test fixes:** `test/agent.js` assumes `/etc/hostname` and `/proc/self/fd`;
-   `test/support/lifecycle.js` asserts `hello.platform === 'linux'` for the _local_ launcher, which
-   reports `darwin` on a Mac; `test/escape/exhaustion.js` uses `statfsSync('/home')`, which on macOS
-   is an autofs trigger reporting 0 blocks — so it passes **vacuously** rather than failing. Also
-   `strayFds()` is `/proc`-only and returns `[]` on macOS, meaning the fd-leak detector silently
-   reports clean.
 
 #### The darwin execution tier: three options, and a decision you need to make
 

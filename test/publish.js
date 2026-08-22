@@ -13,7 +13,7 @@ const test = require('brittle')
 const { spawn } = require('bare-subprocess')
 const fs = require('bare-fs')
 const path = require('bare-path')
-const env = require('bare-env')
+const { hostEnv } = require('../lib/host-env.js')
 
 const schema = require('../lib/schema')
 const config = require('../lib/config.js')
@@ -352,7 +352,7 @@ function cli(args, timeoutMs = 300000) {
     const proc = spawn(Bare.argv[0], [BIN, ...args], {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { PATH: env.PATH, HOME: env.HOME, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR }
+      env: hostEnv()
     })
     let stdout = ''
     let stderr = ''
@@ -412,8 +412,9 @@ test('a missing key is refused BEFORE anything is built', { timeout: 120000 }, a
   // machine is not.
   const detect = require('../lib/isolation/detect.js')
   const toolchains = require('../lib/toolchains.js')
+  let tier
   try {
-    detect.resolve({ min: 'container', image: toolchains.resolve('bare').image })
+    tier = detect.resolve({ min: 'container', image: toolchains.resolve('bare').image }).tier
   } catch (err) {
     t.comment('skipping: ' + err.message.split('\n')[0])
     return t.pass('skipped')
@@ -431,6 +432,10 @@ test('a missing key is refused BEFORE anything is built', { timeout: 120000 }, a
     const r = await cli([
       'run',
       file,
+      // Explicit, because the CLI's default minimum is microvm and that is unreachable on macOS --
+      // otherwise this asserts exit 78 and gets it from tier detection instead of the config check.
+      '--tier',
+      tier,
       '--state',
       path.join(dir, 'state'),
       '--config',

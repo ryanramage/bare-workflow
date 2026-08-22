@@ -9,7 +9,7 @@
 const { spawn, spawnSync } = require('bare-subprocess')
 const fs = require('bare-fs')
 const path = require('bare-path')
-const env = require('bare-env')
+const { hostEnv, which } = require('../../lib/host-env.js')
 const os = require('bare-os')
 
 const ROOT = path.join(__dirname, '../..')
@@ -39,7 +39,7 @@ const ELF_MACHINE = { 0x3e: 'x64', 0xb7: 'arm64' }
 // outright by this project. The agent is cross-BUILT instead, which bare-build does natively.
 function serverArch() {
   const info = spawnSync('podman', ['info', '--format', '{{.Host.Arch}}'], {
-    env: { PATH: env.PATH, HOME: env.HOME }
+    env: hostEnv()
   })
   const arch = info.status === 0 && info.stdout ? info.stdout.toString().trim() : ''
   // podman reports Go arch names.
@@ -66,10 +66,22 @@ const CROSS = has('--cross')
 
 function run(file, args, opts = {}) {
   return new Promise((resolve, reject) => {
+    // Look before spawning. bare-subprocess throws ENOENT for a missing program and the bare process
+    // then exits 144 during teardown regardless -- so a missing `bare-build` produced exit 144 with
+    // NO output at all, which is about as unhelpful as a build failure gets. The thrown error does
+    // not name the program either, so the message has to be built here.
+    if (which(file) === null) {
+      return reject(
+        new Error(
+          `${file} is not on PATH.` +
+            (file === 'bare-build' ? ' Install it with: npm i -g bare-build' : '')
+        )
+      )
+    }
     const proc = spawn(file, args, {
       cwd: ROOT,
       stdio: ['ignore', 'inherit', 'inherit'],
-      env: { PATH: env.PATH, HOME: env.HOME, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR },
+      env: hostEnv(),
       ...opts
     })
     proc.on('error', reject)

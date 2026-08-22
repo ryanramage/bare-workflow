@@ -11,6 +11,7 @@
 // Small limits are injected per test so the overshoot is fast and obvious.
 
 const test = require('brittle')
+const os = require('bare-os')
 const fs = require('bare-fs')
 const h = require('./harness.js')
 
@@ -26,13 +27,35 @@ test('exhaustion: environment', async (t) => {
   t.pass('ready')
 })
 
+// A host filesystem whose free-space numbers actually move, so the exhaustion assertion can fail.
+//
+// Checks that the candidate reports a non-zero total: an autofs trigger like macOS's /home answers
+// statfs with all zeroes rather than erroring, which is exactly how this control went vacuous.
+function watchable() {
+  if (!fs.statfsSync) return null
+  for (const p of ['/home', os.homedir ? os.homedir() : null, '/tmp', '/']) {
+    if (!p) continue
+    try {
+      const st = fs.statfsSync(p)
+      if (Number(st.blocks) > 0 && Number(st.bsize) > 0) return { path: p, before: st }
+    } catch {}
+  }
+  return null
+}
+
 test('workspace writes are capped and cannot fill the host', async (t) => {
   if (!ENVP || !ENVP.ok) return t.pass('skipped')
 
   // The reason /w is a size-capped tmpfs rather than a podman volume: volumes on overlay have NO
-  // size limit, so this exact dd would eat the host's /home. If someone "optimizes" /w back to a
+  // size limit, so this exact dd would eat the host's disk. If someone "optimizes" /w back to a
   // volume, this test is what fails.
-  const before = fs.statfsSync ? fs.statfsSync('/home') : null
+  //
+  // The path used to be a hardcoded '/home'. On macOS that is an autofs trigger (`map auto_home`)
+  // reporting ZERO blocks -- verified with both df and statfsSync -- so `delta` was always 0 and the
+  // "host free space unchanged" assertion below was true no matter what happened. A disk-exhaustion
+  // control that cannot fail is the `ip route` failure mode recorded in CLAUDE.md, and it is worse
+  // than no control because it reads as evidence.
+  const watch = watchable()
 
   // dd prints the ENOSPC line BEFORE its two summary lines, so `tail -1` looks at the wrong one.
   // Grep the whole stream instead.
@@ -63,14 +86,17 @@ test('workspace writes are capped and cannot fill the host', async (t) => {
   const enospc = Number((res.stdout.match(/^(\d+)$/m) || [])[1] || 0)
   t.ok(enospc > 0, 'dd hit ENOSPC rather than growing forever')
 
-  if (before && fs.statfsSync) {
-    const after = fs.statfsSync('/home')
+  // Refuse to report a pass we did not earn: if nothing on this host reports real block counts the
+  // measurement is impossible, and that is said out loud rather than skipped past.
+  t.ok(watch, 'found a host filesystem that reports real block counts')
+  if (watch) {
+    const after = fs.statfsSync(watch.path)
     // tmpfs is RAM-backed, so this should be trivially true -- assert it anyway to pin the
     // property, because it is the whole point of the choice.
-    const delta = Number(before.bfree - after.bfree) * Number(before.bsize)
+    const delta = Number(watch.before.bfree - after.bfree) * Number(watch.before.bsize)
     t.ok(
       Math.abs(delta) < 64 * 1024 * 1024,
-      `host /home free space essentially unchanged (delta ${delta})`
+      `host ${watch.path} free space essentially unchanged (delta ${delta})`
     )
   }
 })

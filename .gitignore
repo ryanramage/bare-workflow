@@ -1,5 +1,12 @@
 node_modules
 package-lock.json
+# ...except the examples' own lockfiles, which are FIXTURES, not build artifacts. examples/offline.yml
+# prefetches from it on the host and installs from that cache with no network at all, so the run is
+# only reproducible if the exact lockfile is committed. The blanket rule above silently excluded it,
+# and the example worked on the machine it was written on purely because a stray `npm install` had
+# left one behind -- it failed on the first fresh clone.
+!examples/project/package-lock.json
+!examples/hello-pear/package-lock.json
 coverage
 .bw-state
 

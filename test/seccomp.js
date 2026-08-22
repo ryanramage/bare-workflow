@@ -12,7 +12,12 @@
 
 const test = require('brittle')
 const fs = require('bare-fs')
+const os = require('bare-os')
+const { spawnSync } = require('bare-subprocess')
 const seccomp = require('../lib/isolation/podman/seccomp.js')
+const { hostEnv, which } = require('../lib/host-env.js')
+
+const PINNED_BASE = 'etc/seccomp/base-v1.json'
 
 // A miniature stand-in for /usr/share/containers/seccomp.json that reproduces the trait we care
 // about: the namespace syscalls sitting in an unconditional allow rule.
@@ -158,14 +163,40 @@ test('serialization is deterministic', (t) => {
   t.ok(seccomp.serialize(gen()).endsWith('\n'))
 })
 
+// The real base profile, wherever it actually lives.
+//
+// `/usr/share/containers/seccomp.json` is a path on the machine that RUNS containers. On Linux that
+// is this host. On macOS and Windows podman is a remote client and the file lives inside the
+// podman-machine VM, so both tests below skipped -- and the second one is the **drift guard**, which
+// is what stops a committed profile diverging from the generator. Silently skipping it means a
+// Mac-only developer can commit a drifted security profile and nothing notices. So: try the host,
+// then ask the machine.
+function loadRealBase() {
+  try {
+    return seccomp.loadBase(fs)
+  } catch {}
+  if (os.platform() === 'linux') return null
+  // `podman machine ssh cat` rather than a bind mount: read-only, needs no container, and works
+  // whether or not any image has been built.
+  const bin = which('podman')
+  if (!bin) return null
+  const r = spawnSync('podman', ['machine', 'ssh', 'cat /usr/share/containers/seccomp.json'], {
+    env: hostEnv()
+  })
+  if (r.status !== 0 || !r.stdout) return null
+  try {
+    return seccomp.assertBase(JSON.parse(r.stdout.toString()))
+  } catch {
+    return null
+  }
+}
+
 // --- against the real host profile ------------------------------------------------------
 
 test('the real base profile has the weakness this generator exists to fix', (t) => {
-  let base
-  try {
-    base = seccomp.loadBase(fs)
-  } catch {
-    t.comment('containers-common base profile not present; skipping')
+  const base = loadRealBase()
+  if (!base) {
+    t.comment('no base profile on this host and none reachable via podman machine; skipping')
     t.pass('skipped')
     return
   }
@@ -180,14 +211,68 @@ test('the real base profile has the weakness this generator exists to fix', (t) 
 })
 
 test('the committed profile matches the generator (drift guard)', (t) => {
-  let committed, expected
+  // Against the PINNED base (etc/seccomp/base-v1.json), never the live one.
+  //
+  // This used to generate from whatever containers-common the local machine shipped, which made the
+  // assertion a function of your distro rather than of our code. Measured across 448 syscalls
+  // between an Arch host and the Fedora CoreOS guest in a macOS podman machine, 6 disagreed -- and
+  // not harmlessly: the Arch base denies `socket(AF_VSOCK)` and the CoreOS one does not, and the
+  // CoreOS base omits the futex_* family so it would fall through to a default EPERM. Generating on
+  // the "wrong" machine would therefore have quietly weakened the host<->guest boundary and risked
+  // the same threading breakage the clone3 -> ENOSYS assertion exists to prevent.
+  //
+  // Pinning makes this test mean "someone changed the generator without regenerating", which is the
+  // only thing it was ever meant to catch. Adopting a new upstream base is a deliberate, reviewable
+  // act: bare scripts/build/seccomp.js --capture.
+  let base
   try {
-    committed = fs.readFileSync('etc/seccomp/build-v1.json', 'utf8')
-    expected = seccomp.serialize(seccomp.generate({ base: seccomp.loadBase(fs) }))
+    base = seccomp.assertBase(JSON.parse(fs.readFileSync(PINNED_BASE, 'utf8')))
   } catch {
-    t.comment('base profile or committed profile unavailable; skipping')
+    t.comment(`no pinned base at ${PINNED_BASE}; skipping`)
+    t.comment('capture one on the machine whose base produced the committed profile:')
+    t.comment('  bare scripts/build/seccomp.js --capture')
     t.pass('skipped')
     return
   }
-  t.is(committed, expected, 'run the generator and commit the result when this fails')
+  let committed
+  try {
+    committed = fs.readFileSync('etc/seccomp/build-v1.json', 'utf8')
+  } catch {
+    t.comment('committed profile unavailable; skipping')
+    t.pass('skipped')
+    return
+  }
+  t.is(
+    committed,
+    seccomp.serialize(seccomp.generate({ base })),
+    'regenerate and commit when this fails: bare scripts/build/seccomp.js'
+  )
+})
+
+test('the pinned base is what the committed profile was actually built from', (t) => {
+  // A pin that does not match the output is worse than no pin: the drift guard above would fail for
+  // a reason nobody can act on. Kept separate so the failure says which of the two is wrong.
+  let base
+  try {
+    base = seccomp.assertBase(JSON.parse(fs.readFileSync(PINNED_BASE, 'utf8')))
+  } catch {
+    t.comment(`no pinned base at ${PINNED_BASE}; skipping`)
+    return t.pass('skipped')
+  }
+  const live = loadRealBase()
+  if (!live) return t.pass('no live base to compare against')
+
+  // Not an equality assertion -- the live base legitimately differs by distro. This reports the
+  // difference so a surprising drift-guard failure has its cause visible in the same run.
+  const namesOf = (d) => new Set(d.syscalls.flatMap((x) => x.names))
+  const pinned = namesOf(base)
+  const current = namesOf(live)
+  const onlyLive = [...current].filter((x) => !pinned.has(x))
+  const onlyPinned = [...pinned].filter((x) => !current.has(x))
+  if (onlyLive.length || onlyPinned.length) {
+    t.comment(`this host's base differs from the pin -- that is expected across distros`)
+    t.comment(`  only in this host's base: ${onlyLive.slice(0, 8).join(', ') || '(none)'}`)
+    t.comment(`  only in the pinned base:  ${onlyPinned.slice(0, 8).join(', ') || '(none)'}`)
+  }
+  t.pass('pin and live base compared')
 })

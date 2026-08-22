@@ -10,9 +10,10 @@
 const test = require('brittle')
 const { spawn } = require('bare-subprocess')
 const path = require('bare-path')
-const env = require('bare-env')
+const { hostEnv } = require('../lib/host-env.js')
 
 const detect = require('../lib/isolation/detect.js')
+const { need, runIds, runId: runIdOf } = require('./support/need.js')
 
 // Container-backed tests carry an explicit timeout: every task boots its own sandbox, so a
 // multi-task graph comfortably exceeds brittle's 30s default -- especially with several test files
@@ -26,7 +27,7 @@ function cli(args, timeoutMs = 300000) {
     const proc = spawn(Bare.argv[0], [BIN, ...args], {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { PATH: env.PATH, HOME: env.HOME, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR }
+      env: hostEnv()
     })
     let stdout = ''
     let stderr = ''
@@ -57,15 +58,8 @@ function events(stdout) {
 
 // Find one event, or fail cleanly.
 //
-// Dereferencing a missing event (`evs.find(...).data.x`) throws an UNCAUGHT TypeError, which kills
-// the whole brittle process -- so one unexpected failure hid every result after it. Observed for
-// real: a base image swapped out mid-run took down the suite at test 236 of 290. A missing event has
-// to be a failed assertion, not a crashed suite.
-function need(t, evs, pred, what) {
-  const found = evs.find(pred)
-  t.ok(found, `event present: ${what}`)
-  return found || { data: {} }
-}
+// need()/runId() moved to test/support/need.js so hello-pear.js can use them too -- it had the same
+// unguarded reads and the same ability to kill the run. See that file for why they exist.
 
 // Can we actually run something? Probed once; every run test skips with a reason if not.
 let RUNNABLE = null
@@ -271,8 +265,30 @@ test('run refuses when it cannot get an image, rather than trying anyway', async
   //
   // Note this exercises the IMAGE path, not the tier path -- tier detection no longer takes an
   // image, and the tier refusal is covered in test/detect.js where availability can be controlled.
+  //
+  // Which is exactly why it needs a usable tier: with no container runtime the run exits 78 for the
+  // TIER reason before it ever looks at an image, and the test would be asserting the right code for
+  // the wrong cause.
+  const can = runnable()
+  if (!can.ok) {
+    t.comment('skipping: ' + can.why)
+    t.comment('without a tier this exits 78 before reaching the image check, so it proves nothing')
+    return t.pass('skipped')
+  }
+
+  // --tier is not optional here. The CLI's default minimum is microvm, which is permanently
+  // unavailable on macOS, so without it the 78 comes from tier detection and the assertion below
+  // passes while the image path is never reached -- the exact "right code, wrong cause" trap this
+  // test's own comment warns about.
   const r = await cli(
-    ['run', 'examples/hello.yml', '--image', 'localhost/definitely-not-built:x'],
+    [
+      'run',
+      'examples/hello.yml',
+      '--image',
+      'localhost/definitely-not-built:x',
+      '--tier',
+      can.tier
+    ],
     120000
   )
   t.is(r.code, 78, 'EX_CONFIG, not a best-effort run')
@@ -584,11 +600,22 @@ test(
 test('a missing toolchain image fails before anything runs', { timeout: 120000 }, async (t) => {
   // The trap this replaced: without a declared toolchain the base image has no npm, and the failure
   // surfaced as `npm: command not found` inside a sandbox rather than as a named, fixable problem.
+  // Needs a usable tier for the same reason as the image test above: otherwise the 78 comes from
+  // tier detection and the assertion passes without exercising the toolchain path at all.
+  const can = runnable()
+  if (!can.ok) {
+    t.comment('skipping: ' + can.why)
+    return t.pass('skipped')
+  }
+
   const fsx = require('bare-fs')
   const tmpf = '/tmp/bw-cli-toolchain-' + Date.now() + '.yml'
   fsx.writeFileSync(tmpf, 'version: 1\ntoolchain: node\nsteps:\n  - npm -v\n')
   try {
-    const r = await cli(['run', tmpf, '--image', 'localhost/definitely-not-built:x'], 120000)
+    const r = await cli(
+      ['run', tmpf, '--image', 'localhost/definitely-not-built:x', '--tier', can.tier],
+      120000
+    )
     t.is(r.code, 78, 'EX_CONFIG: the host is not set up, which is not the same as a failed build')
     t.ok(/not built/.test(r.stdout + r.stderr), 'says the image is missing')
   } finally {
@@ -619,7 +646,10 @@ test('the offline example runs with no flags at all', { timeout: 300000 }, async
   }
 
   try {
-    const r = await cli(['run', 'examples/offline.yml', '--json', '--state', state], 300000)
+    const r = await cli(
+      ['run', 'examples/offline.yml', '--json', '--state', state, '--tier', can.tier],
+      300000
+    )
     if (r.code === 78 && /not built/.test(r.stdout + r.stderr)) {
       t.comment('skipping: node toolchain image not built')
       return t.pass('skipped')
@@ -628,7 +658,11 @@ test('the offline example runs with no flags at all', { timeout: 300000 }, async
 
     const evs = events(r.stdout)
     const start = need(t, evs, (e) => e.cmd === 'run' && e.tag === 'start', 'run/start')
-    t.is(start.data.toolchains.test, 'node', 'the workflow chose its own toolchain')
+    t.is(
+      start.data.toolchains && start.data.toolchains.test,
+      'node',
+      'the workflow chose its own toolchain'
+    )
 
     const out = evs
       .filter((e) => e.cmd === 'stdout')
@@ -673,9 +707,7 @@ test('a run writes an attestation for every task', { timeout: 300000 }, async (t
     t.is(r.code, 0, 'the run succeeded\n' + r.stderr)
 
     const start = events(r.stdout).find((e) => e.cmd === 'run' && e.tag === 'start')
-    const runId = Object.keys(
-      fsx.readdirSync(state + '/runs').reduce((a, k) => ({ ...a, [k]: 1 }), {})
-    )[0]
+    const runId = Object.keys(runIds(t, fsx, state).reduce((a, k) => ({ ...a, [k]: 1 }), {}))[0]
     t.ok(runId, 'a run directory exists')
     void start
 
@@ -732,9 +764,10 @@ test(
     const state = '/tmp/bw-cli-tier-state-' + Date.now()
     fsx.writeFileSync(tmpf, 'version: 1\ntier: container\nsteps:\n  - echo ok\n')
     try {
-      const r = await cli(['run', tmpf, '--json', '--state', state], 240000)
+      const r = await cli(['run', tmpf, '--json', '--state', state, '--tier', can.tier], 240000)
       t.is(r.code, 0)
-      const runId = fsx.readdirSync(state + '/runs')[0]
+      const runId = runIdOf(t, fsx, state)
+      if (!runId) return
       const { summary } = attestation.read(state, runId)
       t.is(summary.run.minTier, 'container', 'the declared requirement is recorded')
       // Declaring a weaker minimum does not opt out of the strongest tier available.
@@ -766,8 +799,9 @@ test(
 
     const pearImage = toolchainLib.resolve('pear').image
     const probe = detectLib.probe({ image: pearImage })
-    if (probe.tiers.every((x) => !x.available)) {
-      t.comment('skipping: the pear toolchain image is not built')
+    const best = probe.tiers.find((x) => x.available)
+    if (!best) {
+      t.comment('skipping: ' + (probe.tiers[0] && probe.tiers[0].reason))
       return t.pass('skipped')
     }
 
@@ -775,7 +809,20 @@ test(
     const out = '/tmp/bw-cli-pear-out-' + Date.now()
     try {
       const r = await cli(
-        ['run', 'examples/pear.yml', '--json', '--concurrency', '2', '--state', state],
+        [
+          'run',
+          'examples/pear.yml',
+          '--json',
+          // Explicit: the CLI's default minimum is microvm, which macOS can never reach, so without
+          // this the run exits 78 at tier detection and every assertion below is about a run that
+          // did not happen.
+          '--tier',
+          best.name,
+          '--concurrency',
+          '2',
+          '--state',
+          state
+        ],
         600000
       )
       if (r.code === 78 && /not built/.test(r.stdout + r.stderr)) {
@@ -799,7 +846,8 @@ test(
       t.ok(stdout.includes('by-arch/linux-x64/app'), 'pear-build produced the by-arch layout')
 
       // The real check: extract the artifact and confirm it is the shape pear consumes.
-      const runId = fsx.readdirSync(state + '/runs')[0]
+      const runId = runIdOf(t, fsx, state)
+      if (!runId) return
       const { localStore } = require('../lib/store')
       const store = localStore({ root: state + '/artifacts', runId })
       const got = await store.get('deployment', out)
@@ -878,7 +926,8 @@ test('`artifacts` lists names, sizes and a total', { timeout: 240000 }, async (t
     const run = await cli(['run', tmpf, '--state', state, '--tier', can.tier])
     t.is(run.code, 0, 'the run succeeded\n' + run.stderr.slice(0, 400))
 
-    const runId = fsx.readdirSync(state + '/runs')[0]
+    const runId = runIdOf(t, fsx, state)
+    if (!runId) return
     const list = await cli(['artifacts', runId, '--state', state])
     t.is(list.code, 0)
 

@@ -112,6 +112,49 @@ async function probeEnvironment() {
   return { ok: true, digest, microvm: k.code === 0 }
 }
 
+// --- who the SERVER thinks it is -------------------------------------------------------
+//
+// The uid that matters for these probes is the uid on the machine where containers actually run --
+// the podman server -- not the uid of this process. On Linux rootless they are the same and the
+// distinction was invisible. On macOS the server is the podman-machine VM, whose user is `core`.
+//
+// This mattered more than a platform quirk. test/escape/index.js computed the uid as
+// `typeof os.getuid === 'function' ? os.getuid() : 1000`, and **bare-os has no getuid at all**, so
+// it was ALWAYS the hardcoded 1000 -- the uid of the machine this was written on. Two consequences:
+//
+//   * the `podman_sock` probe tested /run/user/1000/podman/podman.sock, which does not exist unless
+//     your uid happens to be 1000, so it reported `absent` in both postures and the negative control
+//     never contradicted it. That is the vacuous-probe failure mode from CLAUDE.md, on the probe that
+//     matters most -- a reachable podman socket is root-equivalent. And it was vacuous on any Linux
+//     machine with a different uid too, not just here.
+//   * the negative control's uid_map assertion looked for a uid that is never mapped, so on this Mac
+//     it failed -- which is how the whole thing was found.
+//
+// Asked of podman, once, so the answer is the truth rather than an assumption.
+let serverFactsCache = null
+async function serverFacts() {
+  if (serverFactsCache) return serverFactsCache
+  const r = await sh('podman', ['info', '--format', 'json'], { timeoutMs: 30000 })
+  const facts = { uid: null, socket: null, socketExists: false }
+  if (r.code === 0) {
+    try {
+      const info = JSON.parse(r.stdout)
+      const map = ((info.host || {}).idMappings || {}).uidmap
+      // container_id 0 is the server's own uid mapped to root inside the container.
+      const root = (map || []).find((m) => m.container_id === 0)
+      if (root) facts.uid = String(root.host_id)
+      const remote = (info.host || {}).remoteSocket || {}
+      if (remote.path) facts.socket = String(remote.path).replace(/^unix:\/\//, '')
+      // Whether podman itself says the socket is there. This is what makes the in-container
+      // "absent" a measurement instead of a tautology: the thing we are proving unreachable has to
+      // demonstrably exist somewhere first.
+      facts.socketExists = remote.exists === true
+    } catch {}
+  }
+  serverFactsCache = facts
+  return facts
+}
+
 // --- the host-side canary --------------------------------------------------------------
 // A uniquely-marked, world-readable file in $HOME. World-readable on purpose: under --userns=auto
 // the host uid is unmapped, so a bind-mounted file shows up as `nobody` -- mode 0644 means a leak
@@ -198,6 +241,7 @@ async function runWeakened(digest, script, opts = {}) {
 module.exports = {
   sh,
   probeEnvironment,
+  serverFacts,
   plantCanary,
   removeCanary,
   canaryPath,

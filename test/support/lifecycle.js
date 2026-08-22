@@ -32,6 +32,8 @@ function lifecycleSuite(test, descriptor) {
   // Isolated tiers get a real workspace at /w/src (the agent creates it at startup, because the
   // tmpfs arrives empty). The local launcher runs on the host, where /w does not exist.
   const CWD = descriptor.cwd || undefined
+  // Where the agent actually executes for this launcher -- see the handshake test below.
+  const expectPlatform = descriptor.expectPlatform || 'linux'
   const tag = (s) => `[${name}] ${s}`
 
   async function withBox(opts, fn) {
@@ -50,9 +52,26 @@ function lifecycleSuite(test, descriptor) {
   test(tag('handshake reports the agent identity'), async (t) => {
     await withBox({}, async (box) => {
       t.is(box.hello.agent, 'bw-agent/1')
-      t.is(box.hello.platform, 'linux')
+
+      // Not hardcoded 'linux'. Every ISOLATED tier runs a Linux guest whatever the host is -- that
+      // is the point of TIER_PLATFORM -- but the test-only local launcher runs the agent as a host
+      // process, so on a Mac it reports darwin. Asserting 'linux' for all three made the local
+      // launcher fail on macOS for a reason that had nothing to do with the protocol.
+      t.is(box.hello.platform, expectPlatform, `${name} runs the agent on ${expectPlatform}`)
       t.ok(box.hello.cwd.length > 0, 'agent reports a cwd: ' + box.hello.cwd)
-      t.alike(box.hello.strayFds, [], 'no descriptors leaked into the sandbox')
+
+      // An empty strayFds list means nothing unless the scan actually ran -- on a platform with no
+      // procfs the old code returned [] and this assertion passed while measuring nothing.
+      if (descriptor.isolated) {
+        // An isolated tier is a Linux guest, which always has /proc. "Cannot scan" here is a real
+        // failure, not an environment quirk, so it is asserted rather than skipped.
+        t.is(box.fdScan, 'ok', 'the fd-leak detector actually ran')
+        t.alike(box.hello.strayFds, [], 'no descriptors leaked into the sandbox')
+      } else if (box.fdScan === 'ok') {
+        t.alike(box.hello.strayFds, [], 'no descriptors leaked into the sandbox')
+      } else {
+        t.comment(`fd-leak detection is inert for the ${name} launcher: ${box.fdScan}`)
+      }
     })
   })
 

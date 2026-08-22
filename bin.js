@@ -9,7 +9,7 @@
 
 const fs = require('bare-fs')
 const path = require('bare-path')
-const env = require('bare-env')
+const { hostEnv } = require('./lib/host-env.js')
 const { command, flag, arg, summary, description, header, footer } = require('paparam')
 
 const schema = require('./lib/schema')
@@ -73,7 +73,7 @@ function fail(message, code = 1) {
 function resolveDigest(image) {
   const { spawnSync } = require('bare-subprocess')
   const r = spawnSync('podman', ['image', 'inspect', image, '--format', '{{.Digest}}'], {
-    env: { PATH: env.PATH, HOME: env.HOME, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR }
+    env: hostEnv()
   })
   if (r.status !== 0) return null
   return (r.stdout ? r.stdout.toString() : '').trim() || null
@@ -200,8 +200,36 @@ const run = command(
 
     const { workflow } = parsed
 
-    // Pick the tier BEFORE anything else, so a machine that cannot isolate never gets as far as
-    // looking like it is about to run something.
+    // Static, host-independent problems are reported FIRST -- a typo in --job, a dependency cycle,
+    // a malformed --env. These are properties of the workflow and the command line alone: they need
+    // no podman, they reveal nothing about the host, and nothing runs while they are checked.
+    //
+    // They used to sit behind the tier check, which meant a misspelled job name on a machine with no
+    // container runtime reported "no isolation tier meeting minimum 'microvm' is available" and exit
+    // 78. That is a real diagnosis trap of the same family as the ones this pass exists to remove:
+    // the message names the environment when the actual mistake is in the argument the user typed.
+    let tasks
+    try {
+      tasks = graph.expand(workflow, { job: flags.job })
+    } catch (err) {
+      if (asJson) line(JSON.stringify({ cmd: 'error', code: err.code, error: err.message }))
+      else fail(`${SYM.fail} ${err.message}`)
+      Bare.exitCode = err.code === 'CYCLE' ? 1 : 2
+      return
+    }
+
+    const extraEnv = {}
+    for (const pair of flags.env || []) {
+      const i = String(pair).indexOf('=')
+      if (i <= 0) {
+        fail(`--env expects KEY=VALUE, got ${JSON.stringify(pair)}`, 2)
+        return
+      }
+      extraEnv[String(pair).slice(0, i)] = String(pair).slice(i + 1)
+    }
+
+    // Now the tier, BEFORE anything that touches podman, reads an image or runs a step -- so a
+    // machine that cannot isolate never gets as far as looking like it is about to run something.
     //
     // A workflow may DECLARE its minimum (`tier: microvm`), and the strongest declaration wins:
     // a run is only as isolated as its weakest task, so the requirement has to be the maximum.
@@ -227,26 +255,6 @@ const run = command(
       }
       Bare.exitCode = 78 // EX_CONFIG: the host is not configured to run this safely
       return
-    }
-
-    let tasks
-    try {
-      tasks = graph.expand(workflow, { job: flags.job })
-    } catch (err) {
-      if (asJson) line(JSON.stringify({ cmd: 'error', code: err.code, error: err.message }))
-      else fail(`${SYM.fail} ${err.message}`)
-      Bare.exitCode = err.code === 'CYCLE' ? 1 : 2
-      return
-    }
-
-    const extraEnv = {}
-    for (const pair of flags.env || []) {
-      const i = String(pair).indexOf('=')
-      if (i <= 0) {
-        fail(`--env expects KEY=VALUE, got ${JSON.stringify(pair)}`, 2)
-        return
-      }
-      extraEnv[String(pair).slice(0, i)] = String(pair).slice(i + 1)
     }
 
     // Each job's image comes from its toolchain; --image overrides everything, which is the escape
@@ -425,7 +433,7 @@ const run = command(
       workflow.source ? path.resolve(baseDir, workflow.source) : baseDir,
       (file2, args) => {
         const { spawnSync } = require('bare-subprocess')
-        const r = spawnSync(file2, args, { env: { PATH: env.PATH, HOME: env.HOME } })
+        const r = spawnSync(file2, args, { env: hostEnv() })
         return r.status === 0 && r.stdout ? r.stdout.toString() : null
       }
     )
