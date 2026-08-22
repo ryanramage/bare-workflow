@@ -400,11 +400,17 @@ The full argument list, what each flag buys, and the escape suite that proves it
 | --------------- | ---------------------------------------------------------------------------------- |
 | **linux-x64**   | supported and tested                                                               |
 | **linux-arm64** | expected to work; not yet exercised                                                |
+| **darwin**      | **in progress** — the next target, and the only host that can sign `darwin-arm64`  |
 | **win32**       | **not yet** — known gaps documented in [CLAUDE.md](CLAUDE.md#windows-host-support) |
-| **darwin**      | **not yet** — needs a real VM tier; this is what unlocks `darwin-arm64`            |
 
-macOS and Windows peers are the whole point of the P2P farm, and neither is built. The farm itself —
-routing `darwin-arm64` to a Mac peer over hyperdht — is designed for but not implemented.
+macOS is the priority because it closes the one gap a Linux runner cannot: a Mac is the only machine
+that can sign a `darwin-arm64` binary. Encouragingly that needs only an **ad-hoc** signature
+(`codesign --sign -`, from the Xcode Command Line Tools) — no certificate and no Apple ID. What it
+does need is a darwin _execution_ tier, because a Linux container on a Mac still cannot sign. The
+groundwork and the open design questions are in [CLAUDE.md](CLAUDE.md#macos-host-support).
+
+The farm itself — routing `darwin-arm64` to a Mac peer over hyperdht — is designed for but not
+implemented.
 
 ## Documentation
 

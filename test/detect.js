@@ -73,3 +73,24 @@ test('a weaker-but-available tier is accepted when the minimum allows it', (t) =
   t.ok(detect.RANK[resolved.tier] >= detect.RANK.container)
   t.ok(resolved.tiers.length > 0, 'the full probe is returned for the attestation')
 })
+
+test('a non-Linux host is told the truth, not a pacman command', (t) => {
+  // Decision 4 (refuse rather than degrade) rests entirely on the remediation being actionable --
+  // "It is the only thing that makes anyone install libkrun." On a Mac the old probes looked for
+  // `/usr/lib/libkrun.so.1` and `/dev/kvm`, got the right ANSWER for the wrong reason, and printed
+  // `pacman -S libkrun libkrunfw`. That is the project's first impression on macOS.
+  for (const platform of ['darwin', 'win32']) {
+    const micro = detect.probe({ platform }).tiers.find((x) => x.name === 'microvm')
+    t.absent(micro.available, `${platform}: krun is not reachable`)
+    t.ok(/Linux-only/.test(micro.reason), `${platform}: says why`)
+    t.absent(/pacman/.test(micro.remediation || ''), `${platform}: no unfollowable advice`)
+    t.absent(/dev\/kvm/.test(micro.reason), `${platform}: does not claim a missing device file`)
+    // The honest alternative, and the design question it raises: a podman machine IS a VM boundary,
+    // but one shared across every job -- unlike krun, where each job gets its own.
+    t.ok(/SHARED/.test(micro.remediation || ''), `${platform}: names the real trade-off`)
+  }
+
+  // Unchanged on Linux: the real probes still run and still name real fixes.
+  const linux = detect.probe({ platform: 'linux' }).tiers.find((x) => x.name === 'microvm')
+  t.absent(/Linux-only/.test(linux.reason || ''), 'linux still probes for real')
+})

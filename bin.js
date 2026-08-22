@@ -104,7 +104,16 @@ const validate = command(
     if (!parsed) return
 
     const { workflow } = parsed
-    const caps = targets.describe()
+    // Same reasoning as `doctor`: the "not buildable here" notes must describe where jobs would
+    // actually run. Probing is cheap and `validate` must still work with no container runtime at
+    // all, so an empty tier list simply falls back to the host.
+    let caps
+    try {
+      const probed = detect.probe()
+      caps = targets.describe({ tiers: probed.tiers.filter((t) => t.available).map((t) => t.name) })
+    } catch {
+      caps = targets.describe()
+    }
 
     if (validate.flags.json) {
       line(JSON.stringify({ ok: true, workflow }))
@@ -811,7 +820,12 @@ const doctor = command(
   summary('Report isolation tiers and buildable targets for this host'),
   () => {
     const probe = detect.probe()
-    const caps = targets.describe()
+    // Capability from the tiers that are actually AVAILABLE, not from the host OS. On a Mac these
+    // differ: the host is darwin but every available tier runs a Linux guest, so a host-derived
+    // answer would list darwin-arm64 -- the one target a Mac is wanted for and the one that a Linux
+    // guest cannot produce.
+    const available = probe.tiers.filter((t) => t.available).map((t) => t.name)
+    const caps = targets.describe({ tiers: available })
 
     line(`podman     ${probe.podman || 'not found'}`)
     line('tiers')
@@ -821,7 +835,15 @@ const doctor = command(
       if (!t.available && t.remediation) line(`  ${''.padEnd(10)} fix: ${t.remediation}`)
     }
     line(`platform   ${caps.platform}-${caps.arch}  (${caps.cpus} cpus)`)
+    if (caps.execPlatform !== caps.platform) {
+      line(
+        `builds on  ${caps.execPlatform}  (jobs run in a ${caps.execPlatform} guest, not on the host)`
+      )
+    }
     line(`targets    ${caps.targets.join(', ')}`)
+    if (caps.unsignable.length) {
+      line(`unsignable ${caps.unsignable.join(', ')}  ${SYM.warn} needs a peer that can sign these`)
+    }
     line('toolchains')
     for (const name of toolchains.names()) {
       const entry = toolchains.resolve(name)

@@ -55,6 +55,18 @@ function events(stdout) {
     .map((l) => JSON.parse(l))
 }
 
+// Find one event, or fail cleanly.
+//
+// Dereferencing a missing event (`evs.find(...).data.x`) throws an UNCAUGHT TypeError, which kills
+// the whole brittle process -- so one unexpected failure hid every result after it. Observed for
+// real: a base image swapped out mid-run took down the suite at test 236 of 290. A missing event has
+// to be a failed assertion, not a crashed suite.
+function need(t, evs, pred, what) {
+  const found = evs.find(pred)
+  t.ok(found, `event present: ${what}`)
+  return found || { data: {} }
+}
+
 // Can we actually run something? Probed once; every run test skips with a reason if not.
 let RUNNABLE = null
 function runnable() {
@@ -131,8 +143,7 @@ test('run executes a workflow inside a sandbox', { timeout: 240000 }, async (t) 
   t.is(r.code, 0, 'success exits 0\n' + r.stderr)
 
   const evs = events(r.stdout)
-  const start = evs.find((e) => e.cmd === 'run' && e.tag === 'start')
-  t.ok(start, 'emitted a run/start event')
+  const start = need(t, evs, (e) => e.cmd === 'run' && e.tag === 'start', 'run/start')
   t.is(start.data.tier, can.tier)
   // Images are per-toolchain now, and every one of them is digest-pinned: a floating tag would let
   // whoever controls the registry change what an attestation refers to.
@@ -145,7 +156,7 @@ test('run executes a workflow inside a sandbox', { timeout: 240000 }, async (t) 
 
   const sandbox = evs.find((e) => e.cmd === 'sandbox')
   t.ok(sandbox, 'reported the sandbox it built')
-  t.is(sandbox.data.agent, 'bw-agent/1')
+  t.is(sandbox && sandbox.data.agent, 'bw-agent/1')
   // The attestation is what makes a build auditable after the fact.
   t.ok(sandbox.data.attestation.argv.includes('--network'), 'attestation carries the real argv')
   t.ok(sandbox.data.attestation.image.includes('@sha256:'))
@@ -178,7 +189,11 @@ test('run really executes inside the sandbox, not on the host', { timeout: 24000
   // `uname -r` inside a krun guest reports the guest kernel, which cannot be the host's. This is the
   // assertion that separates "it ran" from "it ran in the sandbox".
   const os = require('bare-os')
-  const hostKernel = os.version ? os.version() : ''
+  // `release()` is `uname -r`; `version()` is the build banner (#1 SMP PREEMPT_DYNAMIC ...). This
+  // used to read version(), so `hostKernel.includes(reported)` could never be true and the assertion
+  // below passed for the wrong reason -- a guest kernel identical to the host's would have slipped
+  // through, which is exactly what it exists to catch.
+  const hostKernel = os.release ? os.release() : ''
   const r = await cli(['run', 'examples/hello.yml', '--json'])
   t.is(r.code, 0)
   const out = events(r.stdout)
@@ -188,7 +203,7 @@ test('run really executes inside the sandbox, not on the host', { timeout: 24000
   const reported = out.trim().split('\n').pop().trim()
   t.ok(/^\d+\.\d+/.test(reported), 'got a kernel version: ' + reported)
   if (hostKernel) {
-    t.absent(hostKernel.includes(reported), 'guest kernel differs from the host kernel')
+    t.not(reported, hostKernel, `guest kernel ${reported} differs from the host's ${hostKernel}`)
   } else t.pass('host kernel unavailable for comparison')
 })
 
@@ -209,7 +224,7 @@ test('a failing step fails the job, stops the run, and exits 1', { timeout: 2400
   t.is(ends[1].data.conclusion, 'failure')
 
   // Events are per-TASK now that a job fans out across targets.
-  const task = evs.find((e) => e.cmd === 'task' && e.tag === 'end')
+  const task = need(t, evs, (e) => e.cmd === 'task' && e.tag === 'end', 'task/end')
   t.is(task.data.status, 'failure')
 
   const out = evs
@@ -293,10 +308,13 @@ test('an output flows from one job to the next', { timeout: 240000 }, async (t) 
   // trusted side, and interpolated into a later job's command.
   t.ok(out.includes('packaging 1.2.3'), 'the downstream job saw the upstream output')
 
-  const versionTask = evs.find(
-    (e) => e.cmd === 'task' && e.tag === 'end' && e.data.task === 'version:host'
+  const versionTask = need(
+    t,
+    evs,
+    (e) => e.cmd === 'task' && e.tag === 'end' && e.data.task === 'version:host',
+    'version:host task/end'
   )
-  t.is(versionTask.data.outputs.value, '1.2.3', 'the declared job output was resolved')
+  t.is(versionTask.data.outputs && versionTask.data.outputs.value, '1.2.3', 'job output resolved')
 })
 
 test('conditions are evaluated, not merely parsed', { timeout: 240000 }, async (t) => {
@@ -345,7 +363,7 @@ test(
     t.is(r.code, 0)
 
     const evs = events(r.stdout)
-    const start = evs.find((e) => e.cmd === 'run' && e.tag === 'start')
+    const start = need(t, evs, (e) => e.cmd === 'run' && e.tag === 'start', 'run/start')
     t.is(start.data.tasks.length, 5, '4 build targets + 1 assemble')
 
     // Unsupported targets are REPORTED. wrkflw maps macos-* onto a Linux image, which produces a
@@ -609,7 +627,7 @@ test('the offline example runs with no flags at all', { timeout: 300000 }, async
     t.is(r.code, 0, 'no flags needed\n' + r.stderr)
 
     const evs = events(r.stdout)
-    const start = evs.find((e) => e.cmd === 'run' && e.tag === 'start')
+    const start = need(t, evs, (e) => e.cmd === 'run' && e.tag === 'start', 'run/start')
     t.is(start.data.toolchains.test, 'node', 'the workflow chose its own toolchain')
 
     const out = evs

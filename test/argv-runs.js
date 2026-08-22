@@ -12,10 +12,19 @@
 const test = require('brittle')
 const { spawn } = require('bare-subprocess')
 const path = require('bare-path')
+const bareEnv = require('bare-env')
+const os = require('bare-os')
 const argvlib = require('../lib/isolation/podman/argv.js')
 
 const IMAGE_REF = 'docker.io/library/ubuntu'
 const PROFILE = path.resolve('etc/seccomp/build-v1.json')
+
+// Homebrew on Apple Silicon is /opt/homebrew/bin, which is absent from the usual POSIX default.
+// Without it `podman` is unresolvable, every probe reports "podman unavailable", and the escape
+// suite AND ITS NEGATIVE CONTROL pass while measuring nothing. Worse, it works on an Intel Mac
+// (where /usr/local/bin IS the Homebrew prefix), so the suite would go vacuous on one machine and
+// not another. Prefer the real PATH; the literal is only a last resort.
+const PROBE_PATH = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'
 
 function sh(file, args, timeoutMs = 180000, env = null) {
   return new Promise((resolve) => {
@@ -23,7 +32,7 @@ function sh(file, args, timeoutMs = 180000, env = null) {
     try {
       proc = spawn(file, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: env || { PATH: '/usr/bin:/bin' }
+        env: env || { PATH: bareEnv.PATH || PROBE_PATH }
       })
     } catch (err) {
       return resolve({ code: -1, stdout: '', stderr: String(err) })
@@ -117,11 +126,24 @@ test('generated argv runs: microvm tier', async (t) => {
     return
   }
   t.is(result.code, 0, 'podman accepted the krun annotation form\n' + result.stderr)
+
   // The guest runs its own kernel; that difference IS the security boundary for this tier.
-  t.absent(
-    result.stdout.includes('cachyos'),
-    'guest kernel is not the host kernel: ' + result.stdout.trim()
-  )
+  //
+  // This used to match the literal string 'cachyos' -- the distro of the machine it was written on.
+  // Vacuous on every other host, which is the same failure shape as the `ip route` probe recorded in
+  // CLAUDE.md: a check that passes because it cannot fail. Compare against the real host kernel, and
+  // skip rather than pass when the host will not tell us what that is.
+  // `os.release()`, not `os.version()`: release is `uname -r` (7.2.0-1-cachyos), version is the
+  // build banner (#1 SMP PREEMPT_DYNAMIC ...). Comparing against the banner would never match and
+  // the assertion would pass for the wrong reason -- the same trap being fixed here.
+  const hostKernel = os.release ? os.release() : ''
+  const guestKernel = result.stdout.trim()
+  if (!hostKernel || !guestKernel) {
+    t.comment(`cannot compare kernels (host ${JSON.stringify(hostKernel)})`)
+    return t.pass('skipped the kernel comparison')
+  }
+  t.not(guestKernel, hostKernel, `guest kernel ${guestKernel} is not the host's ${hostKernel}`)
+  t.absent(hostKernel.startsWith(guestKernel), 'not merely a prefix of it either')
 })
 
 test('generated argv runs under a systemd scope', async (t) => {

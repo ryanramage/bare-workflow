@@ -217,3 +217,21 @@ test('a task id with awkward characters still lands on a safe filename', (t) => 
   t.absent(file.includes(':'), 'colon replaced: ' + file)
   t.ok(file.endsWith('build-linux-x64.json'))
 })
+
+test('the record distinguishes the host from where the build actually ran', (t) => {
+  // "Built on macOS" and "built in a Linux guest on a macOS host" are different claims, and only one
+  // of them implies a signature a Mac could have issued. A consumer deciding whether to trust an
+  // artifact needs the second, so both are recorded rather than left to be inferred from the image.
+  const container = attestation.hostFacts({}, 'container')
+  t.is(container.execPlatform, 'linux', 'a container is a Linux guest whatever the host is')
+
+  const microvm = attestation.hostFacts({}, 'microvm')
+  t.is(microvm.execPlatform, 'linux')
+
+  // A trusted (unsandboxed) step really does run on the host, so there the two agree by definition.
+  const trusted = attestation.hostFacts({}, 'trusted')
+  t.is(trusted.execPlatform, trusted.platform, 'a trusted step runs on the host, and says so')
+
+  t.ok(container.platform, 'the host platform is still reported')
+  t.ok(container.arch)
+})

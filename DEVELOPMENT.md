@@ -23,8 +23,15 @@ npm run build:rpc   # regenerate schema/spec from schema/builder (committed outp
 into the image** because there is no mount available to inject it — that is a consequence of the
 no-host-mounts invariant, not an oversight.
 
+It derives the target architecture from the **podman server** (`podman info --format {{.Host.Arch}}`),
+not from this host, and refuses a mismatch before spending a minute on the build. That distinction is
+not pedantry: on Apple Silicon `podman machine` runs an aarch64 Linux guest, so an x86-64 agent baked
+into it is an `exec format error` reported as `podman exited 126` — which reads as a launcher bug.
+`--cross` builds the binary for another machine and deliberately stops there, since `FROM
+ubuntu:24.04` resolves to the _build_ host's arch and the resulting image would run on neither side.
+
 It takes `--skip-binary` to reuse an existing binary, and **refuses** if that binary is older than
-the agent sources. That guard exists because the failure mode is genuinely misleading: a stale agent
+the agent sources, or if it is for a different architecture than the server. That guard exists because the failure mode is genuinely misleading: a stale agent
 in a fresh image made every step die with `working directory does not exist: /w/src`, which looks
 exactly like a bug in whatever you changed most recently.
 

@@ -31,13 +31,20 @@ const PROFILE = path.resolve('etc/seccomp/build-v1.json')
 const CANARY_NAME = '.bw-escape-canary'
 const CANARY_TEXT = 'CANARY-c7f3a91b2e5d4086-IF-YOU-SEE-THIS-THE-SANDBOX-LEAKED'
 
+// Homebrew on Apple Silicon is /opt/homebrew/bin, which is absent from the usual POSIX default.
+// Without it `podman` is unresolvable, every probe reports "podman unavailable", and the escape
+// suite AND ITS NEGATIVE CONTROL pass while measuring nothing. Worse, it works on an Intel Mac
+// (where /usr/local/bin IS the Homebrew prefix), so the suite would go vacuous on one machine and
+// not another. Prefer the real PATH; the literal is only a last resort.
+const PROBE_PATH = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'
+
 function sh(file, args, { timeoutMs = 120000, hostEnv = null } = {}) {
   return new Promise((resolve) => {
     let proc
     try {
       proc = spawn(file, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: hostEnv || { PATH: '/usr/local/bin:/usr/bin:/bin' }
+        env: hostEnv || { PATH: env.PATH || PROBE_PATH }
       })
     } catch (err) {
       return resolve({ code: -1, stdout: '', stderr: String(err), spawnFailed: true })
