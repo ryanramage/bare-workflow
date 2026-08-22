@@ -57,10 +57,16 @@ podman machine start
    read by the podman service _inside_ the VM. podman machine mounts those two via virtiofs, so a
    normal clone resolves. `/Volumes` is not mounted and fails with `opening seccomp profile failed`
    naming a path that plainly exists on your Mac — the launcher now explains that when it happens.
-3. **`--tier container` is required for every `run`.** `minTier` defaults to `microvm`, and krun is
+3. **`--tier machine` is required for every `run`.** `minTier` defaults to `microvm`, and krun is
    permanently unreachable on macOS: applehv guests get no `/dev/kvm`, and nested virtualisation needs
-   M3+ and is not exposed by podman machine. So a default `run` correctly exits 78. See CLAUDE.md for
-   the open question of what that shared-VM posture should be called.
+   M3+ and is not exposed by podman machine. So a default `run` correctly exits 78.
+
+   `machine` (rank 70) is the honest name for what you get instead: containers run inside the podman
+   machine VM, so an escape lands in the VM rather than on your Mac — a real boundary, but **one VM
+   shared by every job**, where krun gives each job its own. The attestation records the tier and a
+   `shared` flag, so a consumer can tell a shared VM from a dedicated remote builder.
+
+`bare bin.js doctor` checks the three things above under `setup` and tells you which one is wrong.
 
 The agent is cross-built for the podman **server**'s architecture, not this host's, so on Apple
 Silicon you get an arm64 agent automatically. `bare bin.js doctor` reports all of it.

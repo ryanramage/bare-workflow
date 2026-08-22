@@ -32,8 +32,8 @@ rather than silently produced; [see below](#why-darwin-arm64-needs-a-mac).
 - **podman**, rootless is fine — `sudo pacman -S podman` / `sudo apt install podman` /
   `brew install podman`
 - **libkrun**, for the microVM tier — `sudo pacman -S libkrun libkrunfw`. **Linux only**: krun needs
-  `/dev/kvm`, which a macOS podman machine does not provide. On macOS the container tier is the
-  strongest available, so runs need an explicit `--tier container`.
+  `/dev/kvm`, which a macOS podman machine does not provide. On macOS the strongest tier available is
+  `machine`, so runs need an explicit `--tier machine`.
 
 On macOS, `podman machine` must be started and given enough memory for the default limits
 (`podman machine set --memory 8192`), and the checkout has to live somewhere the machine mounts —
@@ -46,6 +46,7 @@ $ bare-workflow doctor
 podman     6.1.0
 tiers
   microvm    rank 90   ✔ available
+  machine    rank 70   ✖ containers run directly on this host, so there is no machine boundary
   container  rank 50   ✔ available
 platform   linux-x64  (24 cpus)
 targets    host, linux-x64, linux-arm64, darwin-x64, win32-x64, win32-arm64
@@ -376,7 +377,7 @@ bare-workflow attest <run-id>       # what ran, under what isolation, producing 
 | ------------------- | --------------------------------------------------------------------------- |
 | `--job <name>`      | run one job and its dependencies                                            |
 | `--concurrency <n>` | how many tasks at once (default 1)                                          |
-| `--tier <name>`     | `microvm` (default) or `container`                                          |
+| `--tier <name>`     | `microvm` (default), `machine`, or `container`                              |
 | `--state <dir>`     | where artifacts and run records go (default `.bw-state`)                    |
 | `--env KEY=VALUE`   | extra environment for every step, repeatable                                |
 | `--config <file>`   | runner config holding named keys                                            |
@@ -388,10 +389,21 @@ that does not resolve. That last one is deliberately distinct from a build failu
 
 ## Isolation, briefly
 
-| Tier                | Mechanism                                                              | Boundary                |
-| ------------------- | ---------------------------------------------------------------------- | ----------------------- |
-| `microvm` (default) | `podman --annotation run.oci.handler=krun`, nested in the hardened set | a separate guest kernel |
-| `container`         | hardened rootless podman + crun                                        | the host kernel         |
+| Tier                | Rank | Mechanism                                                              | Boundary                         |
+| ------------------- | ---- | ---------------------------------------------------------------------- | -------------------------------- |
+| `microvm` (default) | 90   | `podman --annotation run.oci.handler=krun`, nested in the hardened set | a separate guest kernel, per job |
+| `machine`           | 70   | the same hardened container, but podman is a **remote** client         | a separate machine, **shared**   |
+| `container`         | 50   | hardened rootless podman + crun                                        | the host kernel                  |
+
+`machine` is what you get on macOS and Windows, where podman talks to a service inside a
+`podman machine` VM: an escape lands in the VM rather than on your laptop, which is a real boundary —
+but it is one VM shared by every job, where `microvm` gives each job its own. That difference is
+recorded in the attestation (`isolation.shared`) rather than left to be inferred from the tier name,
+because a shared VM and a dedicated remote builder both report `machine`.
+
+An image built for another architecture is **refused**, not run: with Rosetta or qemu-user registered
+it would otherwise execute under emulation, and an emulated build can be subtly wrong while being
+attested exactly like a native one.
 
 There is deliberately **no host-execution tier**. Every step runs with `--network none`,
 `--cap-drop ALL`, a generated seccomp profile, `--userns auto`, a read-only root and no host mounts

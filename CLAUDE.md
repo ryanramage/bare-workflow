@@ -317,6 +317,21 @@ already recorded in existing attestations, so nothing about the shipped posture 
 bullets above were confirmed present in the captured pin and carried through to the output. The drift
 guard now runs instead of skipping.
 
+**Emulation is reachable on a Mac, and it defeats the guard meant to catch it.** A `podman machine`
+on Apple Silicon registers a **`rosetta`** binfmt handler for x86-64 ELF (`interpreter /mnt/rosetta`)
+plus **qemu-user handlers for ~31 other architectures**. There is no `qemu-x86_64` — Rosetta serves
+that one. Measured: `podman run --platform linux/amd64 ubuntu:24.04 uname -m` prints `x86_64` and
+exits 0. `podman machine set` has **no** `--rosetta` flag, so it cannot be turned off without a fresh
+`init`, and the qemu handlers come from the CoreOS image and would survive that anyway.
+
+Why this is a hard refusal rather than a warning: it is exactly the guard emulation defeats. An
+x86-64 agent baked into an arm64 image is supposed to be a loud `exec format error` (podman exit 126) — under Rosetta it simply works, so the arch guard in `scripts/build/agent.js` reports success
+for an emulated build, and the attestation records it identically to a native one. Decision 2 is
+therefore enforced in code (`lib/isolation/arch.js`), not by machine configuration: configuration is
+not a control, and a teammate's VM is not ours to configure. A related trap found in passing —
+`podman pull --platform linux/amd64 ubuntu:24.04` **overwrites the tag**, so pulling once for a test
+would silently make the whole escape suite run emulated.
+
 #### Answers to the macOS blockers, now measured
 
 - **Blocker 1 (agent architecture) is closed.** `scripts/build/agent.js` read `arm64` from the podman
@@ -504,24 +519,38 @@ guest, and stages to a `pear://` link.
 
 What remains:
 
-1. **The shared-VM tier decision.** Still open, still yours. `detect.js` probes via `podman info` now
-   and tells the truth ("krun is Linux-only ... the podman-machine VM is a host boundary but is SHARED
-   between jobs"), but that posture has no name and no rank of its own. Until it gets one, macOS users
-   must pass `--tier container` for every run, which is honest but repetitive.
-2. **The macOS setup story.** Three things must be true and none are checked as a set: the machine
-   needs enough RAM for the default limits (the shipped defaults want 8 GiB, and `podman machine set
---memory` resizes in place — no need to recreate), the checkout must live somewhere the VM mounts
-   (`/Users` or `/private`, not `/Volumes`), and `bare-build` must be on PATH. `doctor` could check
-   all three.
-3. **Rosetta is still enabled in the machine** (`/var/mnt rosetta virtiofs` inside the guest). Decision
-   2 forbids emulation, and `podman machine set` has no `--rosetta` flag — only a fresh `init` can turn
-   it off. It is not currently reachable by a build (the agent and images are all native arm64), but it
-   is a live x86-64 emulation path sitting inside the sandbox host, and it would let a wrong-arch agent
-   silently work rather than failing the way the arch guard intends.
-4. **`resolveLimits()` never checks the machine's real capacity.** It validates the tmpfs sizes against
-   each other but not against `podman info`'s `MemTotal`, so a `--memory` cap above the VM's physical
-   RAM is no cap at all and filling `/w` OOMs the VM rather than the job. This is a server-side fact
-   nothing reads.
+1. ~~**The shared-VM tier decision.**~~ **Decided and built.** It is the **`machine`** tier, rank
+   **70** — between `container` (50) and `microvm` (90). The probe asks `podman info` for
+   `Host.ServiceIsRemote` rather than testing `os.platform()`, so a Linux user running a podman
+   machine gets the same answer a Mac user does, and a genuinely remote podman host does too. The
+   attestation records `isolation.shared` alongside the tier name, because a shared podman-machine VM
+   and a dedicated remote builder both report `machine` and are not the same promise.
+
+   The default minimum stays `microvm`, so **macOS still needs an explicit `--tier machine`** — no
+   default anywhere got weaker. `TIER_PLATFORM.machine = 'linux'`, which is what keeps `darwin-arm64`
+   correctly refused; there is a test asserting exactly that, because "we have a stronger tier on
+   macOS now" is a tempting and completely wrong reason to think a Mac can build its own platform.
+
+2. ~~**The macOS setup story.**~~ **Done.** `detect.setupChecks()` returns records for all three and
+   `doctor` renders them under `setup`. Each is **tri-state**: `ok: null` means "could not tell",
+   which is deliberately not the same as passing. Two details worth keeping:
+
+   - The memory requirement is derived from `argv.resolveLimits()` rather than written down, so it
+     cannot drift from what a run actually asks for.
+   - The advice asks for **more** than the shortfall. A machine created with `--memory 8192` reports
+     ~7.73 GiB to containers, so advising exactly the requirement produces the worst kind of
+     remediation: one that tells you to set the value you already set. Found by the check firing on
+     the very machine that had just been resized to satisfy it.
+
+3. ~~**Rosetta.**~~ **Enforced in code instead of configuration** — see the emulation finding above.
+   `lib/isolation/arch.js` refuses any image whose architecture is not the runtime's, before anything
+   runs, with exit 78 and a message that names both architectures and the mechanism. Rosetta is
+   deliberately left enabled: the refusal holds on any machine however it was created, including a
+   teammate's, which configuration never could.
+4. **`resolveLimits()` still does not check the machine's real capacity itself.** `doctor` now does
+   (item 2), which is where a human sees it — but a `run` will still accept an 8 GiB cap on a 2 GiB
+   machine and OOM the VM rather than the job. Wiring the same server-side fact into the run preflight
+   is the remaining half.
 5. **Then the actual goal:** a darwin execution tier, so `darwin-arm64` can be built. See below.
 
 #### The darwin execution tier: three options, and a decision you need to make
@@ -548,16 +577,64 @@ arguably trusted-only by construction until a VM tier exists.
 The argument _against_: a build is exactly the thing you do not trust, and "trusted key" is a much
 weaker guarantee for arbitrary build scripts than for a single `pear-ci` call with no user code in it.
 
-My recommendation, for what it is worth: **`sandbox-exec` first.** It is a real boundary, it needs no
-VM image, no licensing question and no EULA cap, it keeps decision 3 intact in spirit, and Bazel and
-Nix have both proven it viable for sandboxed builds. Then a VM tier later for untrusted work. If a
-native tier is added in any form, `strayFds()` must stop silently returning `[]` first — a security
-control that degrades silently is what decision 4 exists to forbid.
+**Decided: `sandbox-exec` first.** It is a real boundary, it needs no VM image, no licensing question
+and no EULA cap, it keeps decision 3 intact in spirit, and Bazel and Nix have both proven it viable
+for sandboxed builds. A VM tier can come later for genuinely untrusted work.
 
-Whatever is chosen, three mechanical pieces follow: a `TIER_PLATFORM` entry mapping it to `'darwin'`
-(that entry is what makes `buildableOn('darwin', 'darwin-arm64')` true legitimately), a probe and rank
-in `detect.js`, and its own limits vocabulary — `argv.js` is entirely podman-flag-shaped and does not
-transfer.
+##### The premise is no longer a theory — it is measured
+
+Four things were verified on the Apple Silicon box before writing any of the plan below, because the
+whole tier is pointless if any of them is false:
+
+| Question                                                        | Measured answer                                                                        |
+| --------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Does a native `darwin-arm64` build produce a **runnable** file? | **Yes.** `Mach-O 64-bit executable arm64`, `Signature=adhoc`, `flags=0x2(adhoc)`, runs |
+| Is a certificate or Apple ID needed?                            | **No.** Xcode CLT `codesign` alone; the template passes no `--sign`                    |
+| Does `codesign` still work **inside** `sandbox-exec`?           | **Yes.** Same ad-hoc signature, same running binary, built under a Seatbelt profile    |
+| Does Seatbelt actually deny anything?                           | **Yes.** `cat ~/.ssh/id_ed25519` → `Operation not permitted` under a `deny file-read*` |
+
+That last pair is the crux and the reason to stop worrying about this approach: signing works under
+Seatbelt _and_ Seatbelt keeps the build out of the host's secrets, simultaneously. `sandbox-exec` is
+also formally deprecated (since 10.14) and entirely functional — that tension is real but Nix and
+Bazel both ship on it, and the deprecation has outlived several macOS majors.
+
+##### What has to be built
+
+1. **`TIER_PLATFORM.darwin_native = 'darwin'`** (name it whatever) in `lib/targets.js`. This single
+   entry is what legitimately makes `buildableOn('darwin', 'darwin-arm64')` true, and it must be
+   added **only** together with the rest — on its own it makes the runner claim a capability it has
+   no way to execute, which is precisely the dead-binary failure the model exists to refuse.
+2. **A probe and rank in `detect.js`.** The probe is cheap and should assert all three of
+   `sandbox-exec`, `codesign` and a usable Xcode CLT (`xcode-select -p`) rather than just the first,
+   since a machine with `sandbox-exec` and no CLT would fail late and confusingly. Rank it **below
+   `machine` (70)**: same-kernel confinement is weaker than a separate machine. Somewhere near 40 is
+   honest — it is not a container either, and pretending otherwise repeats the mistake `machine` was
+   added to fix.
+3. **Its own limits vocabulary.** `argv.js` is entirely podman-flag-shaped and does not transfer:
+   there is no `--memory`, no `--pids-limit`, no `--userns` and no tmpfs. The analogues are `ulimit`,
+   a `TMPDIR` inside a per-job scratch directory, and an SBPL profile — and several podman limits have
+   **no** analogue at all. Say which ones are unenforceable in the attestation rather than emitting a
+   limits record that implies they were applied.
+4. **The SBPL profile, generated the way the seccomp profile is.** Same shape as
+   `lib/isolation/podman/seccomp.js`: a pure function producing a reviewable document, a committed
+   output, and a drift guard. Start from `(deny default)` and allow, not the reverse — the probe above
+   used `(allow default)` because it was only testing whether `codesign` survives confinement, and
+   that posture is **not** a sandbox.
+5. **`strayFds()` must gain a darwin backend first.** It is `/proc`-only, and this session made it
+   _report_ that honestly rather than silently returning `[]` — but "honestly unsupported" is fine for
+   a test-only local launcher and not fine for a real tier. A native tier whose fd-leak detector
+   cannot run is a security control that does not exist. This is a prerequisite, not a follow-up.
+
+##### The decision-3 tension, restated now that the facts are in
+
+Decision 3 says "no host-execution tier, ever", and `sandbox-exec` runs on the host kernel. The
+distinction that makes this a port rather than a reversal: decision 3's actual argument is that "a
+command allowlist over host processes is defeated by the first `sh -c`". A Seatbelt profile is not a
+command allowlist — it is kernel-enforced MAC that applies to `sh -c` and everything it spawns, which
+is exactly what the measurement above demonstrates. What decision 3 forbids is
+`test/support/local-launcher.js` promoted to `lib/`, i.e. **unconfined** host execution. That remains
+forbidden, and this tier must not become a route to it: if the Seatbelt profile fails to load, the
+tier is unavailable and the run refuses. It must never fall back to running unconfined.
 
 ### After macOS
 
@@ -744,5 +821,14 @@ Things that have gone wrong in this project's own development, worth avoiding:
   override that supersedes it, so the test passed on a Mac (where `can.tier` IS `container`) and
   failed on Linux (where it is `microvm`). A blanket fix applied to a test suite deserves a check for
   the one test whose subject is the thing being blanket-fixed.
+- **The hello-pear publish job flakes under full-suite load.** Observed twice on macOS: the run exits
+  1 with no `publish/done` event, while the same test passes in isolation. Not diagnosed — the likely
+  candidate is pear-ci's 120 s deadline (`DEFAULT_TIMEOUT_MS`), which is a wall-clock race against a
+  local DHT peer replicating, on a machine simultaneously running containers for five build targets.
+  Two things were done rather than pretending it is fixed: the test now surfaces the
+  `publish/error` reason in the same run, and every read of the publish record is guarded so a
+  missing one **fails** instead of throwing an uncaught ENOENT that kills the suite and reports the
+  failure against whatever test happened to be last. If it recurs, the reason will now be in the
+  output.
 - **Rebuild the agent and every layered image** after touching anything in `lib/` that the agent
   bundles. The in-sandbox half of a change otherwise silently does not exist.

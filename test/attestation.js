@@ -159,6 +159,47 @@ test('the record captures task, host, source and step facts', (t) => {
   t.ok(record.createdAt.endsWith('Z'), 'timestamped in UTC')
 })
 
+test('the record says whether the boundary was shared, not just its name', (t) => {
+  // `machine` and `microvm` can both be honest answers on the same artifact and mean very different
+  // things: one VM shared by every job versus a fresh one per job. The farm's whole reason for
+  // carrying a tier is so a consumer can reject weakly-built artifacts, and it cannot make that call
+  // from the name alone -- a podman-machine VM and a dedicated remote builder are both `machine`.
+  const shared = attestation.forTask({
+    run: { id: 'r1', workflow: 'w', file: 'w.yml' },
+    task: TASK,
+    job: JOB,
+    result: RESULT,
+    isolation: { tier: 'machine', shared: true },
+    source: { dir: '/src' },
+    versions: {}
+  })
+  t.is(shared.isolation.tier, 'machine')
+  t.is(shared.isolation.shared, true, 'the caveat is recorded, not implied by the tier name')
+
+  const dedicated = attestation.forTask({
+    run: { id: 'r1', workflow: 'w', file: 'w.yml' },
+    task: TASK,
+    job: JOB,
+    result: RESULT,
+    isolation: { tier: 'machine', shared: false },
+    source: { dir: '/src' },
+    versions: {}
+  })
+  t.is(dedicated.isolation.shared, false, 'and distinguishes a dedicated builder from a shared VM')
+
+  // Absent means "the question does not apply here", which is not the same as false.
+  const quiet = attestation.forTask({
+    run: { id: 'r1', workflow: 'w', file: 'w.yml' },
+    task: TASK,
+    job: JOB,
+    result: RESULT,
+    isolation: { tier: 'container' },
+    source: { dir: '/src' },
+    versions: {}
+  })
+  t.is(quiet.isolation.shared, null, 'null rather than a guess when nothing was reported')
+})
+
 test('a failed task still gets a record', (t) => {
   // An attestation that only exists on success tells you nothing about the run you want to inspect.
   const record = attestation.forTask({

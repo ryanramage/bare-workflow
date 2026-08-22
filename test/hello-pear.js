@@ -328,6 +328,13 @@ test(
       // so the next line dereferenced undefined and took the whole suite down with an uncaught
       // TypeError. Seen for real -- this test passes in isolation but had not run its publish job
       // during one full-suite run, and the crash hid every test after it.
+      // If the publish did not finish, say WHY in the same run rather than leaving a bare "event
+      // missing". The runner emits `publish/error` with the reason, and pear-ci's own failure mode is
+      // a 120s deadline whose message explains that staging is not complete until another peer has
+      // replicated -- worth surfacing, because this job has been observed to flake under full-suite
+      // load while passing in isolation.
+      const failed = evs.find((e) => e.cmd === 'publish' && e.tag === 'error')
+      if (failed) t.comment('publish failed: ' + (failed.data && failed.data.error))
       const published = need(t, evs, (e) => e.cmd === 'publish' && e.tag === 'done', 'publish/done')
       const pub = published.data || {}
       t.ok(/^pear:\/\/[a-z0-9]{52}$/.test(pub.link || ''), 'a real link: ' + pub.link)
@@ -337,9 +344,20 @@ test(
         t.ok(pub.snapshot && pub.snapshot.after.length > 0, 'the snapshot moved forward')
       }
 
-      const record = JSON.parse(
-        fs.readFileSync(path.join(state, 'runs', runId, 'stage-host.json'), 'utf8')
-      )
+      // Guarded, like the publish event above. If the publish job did not run there is no
+      // stage-host.json, and an unguarded readFileSync here is an uncaught ENOENT that kills the
+      // whole suite -- taking the escape suite with it and reporting the failure against whatever
+      // test happened to be last. Seen for real: the publish job is occasionally flaky under full
+      // suite load, and this crashed instead of failing.
+      const recordPath = path.join(state, 'runs', runId, 'stage-host.json')
+      let record = null
+      try {
+        record = JSON.parse(fs.readFileSync(recordPath, 'utf8'))
+      } catch (err) {
+        t.fail(`no publish record at ${recordPath} (${err.code || err.message})`)
+      }
+      if (!record) return
+
       t.is(record.isolation.tier, 'trusted', 'the record says plainly that this was not sandboxed')
       t.is(
         record.inputs.artifactDigest,

@@ -781,10 +781,18 @@ test(
       if (!runId) return
       const { summary } = attestation.read(state, runId)
       t.is(summary.run.minTier, 'container', 'the declared requirement is recorded')
-      // Declaring a weaker minimum does not opt out of the strongest tier available.
+
+      // Asserted as a PROPERTY, not as a list of tier names. Declaring a weaker minimum does not opt
+      // out of the strongest tier available, so what actually ran depends on the machine -- microvm
+      // on a Linux box with krun, `machine` on a Mac. The previous version enumerated
+      // `microvm || container` and broke the moment the `machine` tier was added, which is the same
+      // host-dependence this test's own comment above warns about, one level up.
+      const { RANK } = require('../lib/isolation/detect.js')
+      t.ok(RANK[summary.run.tier] !== undefined, 'a known tier ran: ' + summary.run.tier)
       t.ok(
-        summary.run.tier === 'microvm' || summary.run.tier === 'container',
-        'and what actually ran'
+        RANK[summary.run.tier] >= RANK[summary.run.minTier],
+        `${summary.run.tier} (${RANK[summary.run.tier]}) is at least the declared ` +
+          `${summary.run.minTier} (${RANK[summary.run.minTier]})`
       )
     } finally {
       try {

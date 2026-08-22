@@ -16,6 +16,8 @@ const schema = require('./lib/schema')
 const targets = require('./lib/targets.js')
 const graph = require('./lib/graph.js')
 const detect = require('./lib/isolation/detect.js')
+const arch = require('./lib/isolation/arch.js')
+const argvlib = require('./lib/isolation/podman/argv.js')
 const { create: createLauncher } = require('./lib/isolation/podman/launcher.js')
 const { create: createTaskRun } = require('./lib/run')
 const { localStore } = require('./lib/store')
@@ -75,6 +77,25 @@ function resolveDigest(image) {
   const r = spawnSync('podman', ['image', 'inspect', image, '--format', '{{.Digest}}'], {
     env: hostEnv()
   })
+  if (r.status !== 0) return null
+  return (r.stdout ? r.stdout.toString() : '').trim() || null
+}
+
+// The image's architecture, and the architecture the container runtime actually is. The policy that
+// uses them -- refuse rather than let a build run emulated -- is in lib/isolation/arch.js, which
+// explains why at length.
+function imageArch(image) {
+  const { spawnSync } = require('bare-subprocess')
+  const r = spawnSync('podman', ['image', 'inspect', image, '--format', '{{.Architecture}}'], {
+    env: hostEnv()
+  })
+  if (r.status !== 0) return null
+  return (r.stdout ? r.stdout.toString() : '').trim() || null
+}
+
+function serverArch() {
+  const { spawnSync } = require('bare-subprocess')
+  const r = spawnSync('podman', ['info', '--format', '{{.Host.Arch}}'], { env: hostEnv() })
   if (r.status !== 0) return null
   return (r.stdout ? r.stdout.toString() : '').trim() || null
 }
@@ -281,6 +302,18 @@ const run = command(
       if (digest) digests.set(chosen.image, digest)
       else missing.push(chosen)
     }
+    // Refuse an image whose architecture is not the runtime's, BEFORE any of it runs. Decision 2
+    // refuses emulation outright, and on macOS a foreign-arch image would otherwise succeed under
+    // Rosetta rather than failing. See lib/isolation/arch.js.
+    try {
+      arch.assertNative([...digests.keys()], serverArch(), imageArch)
+    } catch (err) {
+      if (asJson) line(JSON.stringify({ cmd: 'error', code: err.code, error: err.message }))
+      else fail(`${SYM.fail} ${err.message}`)
+      Bare.exitCode = 78 // EX_CONFIG: the machine is not set up to build this safely
+      return
+    }
+
     if (missing.length) {
       const report = [
         `${SYM.fail} required sandbox image${missing.length === 1 ? '' : 's'} not built:`
@@ -556,6 +589,7 @@ const run = command(
           result,
           isolation: {
             tier: resolved.tier,
+            shared: resolved.shared,
             image: `${chosen.image.split(':')[0]}@${digests.get(chosen.image)}`,
             seccompProfile: SECCOMP,
             program: launcher.built.program,
@@ -860,6 +894,21 @@ const doctor = command(
         `  ${name.padEnd(11)} ${built ? SYM.ok + ' built    ' : SYM.fail + ' not built'} ${entry.image}`
       )
       if (!built) line(`  ${''.padEnd(11)}   build it: ${entry.build}`)
+    }
+
+    // Setup facts that otherwise fail LATE and look like something else entirely: a machine too
+    // small for the limits (a guest OOM-kill reported as `podman exited <n>`), a checkout the podman
+    // service cannot see (a seccomp path error naming a file that plainly exists), and a missing
+    // bare-build. The memory figure is derived from the real defaults rather than written down, so
+    // it cannot drift from what a run will actually ask for.
+    const limits = argvlib.resolveLimits({ tier: 'container' })
+    const checks = detect.setupChecks({ requiredBytes: limits.memoryBytes })
+    if (checks.length) {
+      line('setup')
+      for (const c of checks) {
+        const mark = c.ok === true ? SYM.ok : c.ok === false ? SYM.fail : SYM.warn
+        line(`  ${mark} ${c.name.padEnd(32)} ${c.detail}`)
+      }
     }
   }
 )
