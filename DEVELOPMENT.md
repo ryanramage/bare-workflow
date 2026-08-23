@@ -68,6 +68,54 @@ podman machine start
 
 `bare bin.js doctor` checks the three things above under `setup` and tells you which one is wrong.
 
+### Building `darwin-arm64` natively (the `seatbelt` tier)
+
+The one target a Linux runner cannot produce. It needs the Xcode Command Line Tools and a rendered
+Seatbelt profile:
+
+```bash
+xcode-select --install          # for codesign; the tier refuses without it
+npm run build:sandbox           # renders etc/sandbox/build-v1.sb
+bare bin.js run <workflow> --tier seatbelt
+```
+
+Tier selection is capability-aware, so a run declaring `darwin-arm64` picks `seatbelt` while a
+linux-only run still picks the strongest available tier. `--tier` remains a MINIMUM, which is why it
+is needed here at all: the default minimum is `microvm` and seatbelt ranks below it.
+
+> [!IMPORTANT]
+> **A version-manager shim will not work inside the sandbox.** Volta, nvm, asdf and friends resolve
+> the real binary through mutable state and often take a lock, and the profile does not grant write
+> access to your home directory — Volta fails with `Could not find executable` and
+> `Resource temporarily unavailable (os error 35)`. Do **not** widen the profile to fix it: a build
+> that can write `~/.volta` can replace a binary that later runs unsandboxed. The runner resolves
+> shims on the host instead (`volta which <tool>`) and grants the resolved directories; if you use a
+> different manager, that resolution needs teaching about it in `seatbeltToolchain()` in `bin.js`.
+
+### Building `darwin-arm64` natively (the `seatbelt` tier)
+
+The one target a Linux runner cannot produce. It needs the Xcode Command Line Tools and a rendered
+Seatbelt profile:
+
+```bash
+xcode-select --install          # for codesign; the tier refuses without it
+npm run build:sandbox           # renders etc/sandbox/build-v1.sb
+bare bin.js run <workflow> --tier seatbelt
+```
+
+Tier selection is capability-aware, so a run declaring `darwin-arm64` picks `seatbelt` while a
+linux-only run still picks the strongest available tier. `--tier` remains a MINIMUM, which is why it
+is needed here at all: the default minimum is `microvm` and seatbelt ranks below it.
+
+> [!IMPORTANT]
+> **A version-manager shim will not work inside the sandbox.** Volta, nvm, asdf and friends resolve
+> the real binary through mutable state and often take a lock, and the profile does not grant write
+> access to your home directory -- Volta fails with `Could not find executable` and
+> `Resource temporarily unavailable (os error 35)`. Do **not** widen the profile to fix it: a build
+> that can write `~/.volta` can replace a binary that later runs unsandboxed. The runner resolves
+> shims on the host instead (`volta which <tool>`) and grants the resolved directories; if you use a
+> different manager, that resolution needs teaching about it in `seatbeltToolchain()` in `bin.js`.
+
 The agent is cross-built for the podman **server**'s architecture, not this host's, so on Apple
 Silicon you get an arm64 agent automatically. `bare bin.js doctor` reports all of it.
 

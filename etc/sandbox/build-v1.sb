@@ -1,0 +1,91 @@
+;; bare-workflow seatbelt profile v1 -- GENERATED, do not edit
+;;
+;; Regenerate with: bare scripts/build/sandbox.js
+;; The sha256 of the rendered profile is recorded in every attestation.
+(version 1)
+
+;; Deny everything, then grant. The inverse posture is not a sandbox.
+(deny default)
+
+;; A profile that is too tight fails in a genuinely unhelpful way -- SIGABRT with no
+;; message, because the loader dies before anything can report. Bisect the rules, or
+;; try: log stream --predicate 'sender == "Sandbox"'
+
+;; --- process ---------------------------------------------------------------
+;; A build forks compilers and shells; without these the profile cannot even exec.
+(allow process-fork)
+(allow process-exec)
+(allow signal (target same-sandbox))
+
+;; Read-only kernel parameters. Cheap to grant and load-bearing in a way nothing about
+;; the failure suggests: without it any Rust binary dies at startup with
+;;   panicked at 'failed to set up alternative stack guard page: Invalid argument'
+;; because the runtime queries page size and stack limits through sysctl and gets
+;; EINVAL. Hit for real -- npm here is a Volta shim, which is written in Rust, so the
+;; whole toolchain fell over with a message that never mentions the sandbox.
+(allow sysctl-read)
+
+;; --- read-only system ------------------------------------------------------
+;; The root directory ENTRY, as a literal. Without it dyld cannot resolve anything and
+;; every process dies with SIGABRT and no message at all -- not even /usr/bin/true
+;; runs. Found by bisection, because the abort produces no diagnostic and the Sandbox
+;; log yields nothing useful for it.
+;;
+;; `literal`, emphatically not `subpath`. This grants the root entry itself and nothing
+;; beneath it; `(subpath "/")` would hand over the whole filesystem including the home
+;; directory this tier exists to protect, while looking like the same line of config.
+(allow file-read* (literal "/"))
+
+;; Everything else is granted by explicit subpath. Note the absence of /Users.
+(allow file-read* (subpath "/usr/lib"))
+(allow file-read* (subpath "/usr/share"))
+(allow file-read* (subpath "/usr/bin"))
+(allow file-read* (subpath "/bin"))
+(allow file-read* (subpath "/sbin"))
+(allow file-read* (subpath "/usr/sbin"))
+(allow file-read* (subpath "/System"))
+(allow file-read* (subpath "/Library"))
+(allow file-read* (subpath "/private/var/db/dyld"))
+(allow file-read* (subpath "/private/var/db/timezone"))
+(allow file-read* (subpath "/dev/urandom"))
+(allow file-read* (subpath "/dev/random"))
+(allow file-read* (subpath "/dev/zero"))
+(allow file-read* (subpath "/dev/dtracehelper"))
+(allow file-read* file-write* (literal "/dev/null"))
+(allow file-read* file-write* (literal "/dev/dtracehelper"))
+(allow file-read* (literal "/private/etc/localtime"))
+(allow file-read* (literal "/private/etc/protocols"))
+(allow file-read* (literal "/private/etc/services"))
+(allow file-read* (literal "/private/var/select/sh"))
+
+;; --- the toolchain ---------------------------------------------------------
+(allow file-read* (subpath "/CANONICAL/toolchain"))
+
+;; --- the workspace ---------------------------------------------------------
+;; The only writable location. Everything the build produces lands here, and the
+;; driver tars it out across the protocol exactly as the container tiers do.
+(allow file* (subpath "/w"))
+
+;; --- ancestor traversal -----------------------------------------------------
+;; stat-only rights on the directories leading to everything granted above. Resolving
+;; a path walks its ancestors, and a subpath grant does not imply them -- so without
+;; these a build fails on `lstat /Users` or `lstat /private` rather than on anything it
+;; was meant to be denied. `file-read-metadata` only: statable, not listable, not
+;; readable. /Users becomes statable; /Users/someone-else stays invisible.
+(allow file-read-metadata (literal "/CANONICAL"))
+(allow file-read-metadata (literal "/dev"))
+(allow file-read-metadata (literal "/etc"))
+(allow file-read-metadata (literal "/private"))
+(allow file-read-metadata (literal "/private/etc"))
+(allow file-read-metadata (literal "/private/var"))
+(allow file-read-metadata (literal "/private/var/db"))
+(allow file-read-metadata (literal "/private/var/select"))
+(allow file-read-metadata (literal "/tmp"))
+(allow file-read-metadata (literal "/usr"))
+(allow file-read-metadata (literal "/var"))
+
+;; --- what stays denied, stated for the reader -------------------------------
+;; No network: matches --network none. Prefetch happens on the host before the sandbox
+;; exists, so a build never needs egress.
+;; No mach-lookup beyond the defaults, no file-write outside the workspace, and
+;; therefore no reachable ~/.ssh, ~/.npmrc, ~/.aws or login keychain.

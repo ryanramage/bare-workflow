@@ -70,16 +70,33 @@ test('describe reports every target this host can produce a USABLE binary for', 
   // sending darwin-arm64 to. A Mac merely running Linux containers is covered separately below.
   const mac = targets.describe({ platform: 'darwin', arch: 'arm64', execPlatform: 'darwin' })
   t.ok(mac.targets.includes('darwin-arm64'), 'which is exactly what a mac peer is for')
-  t.ok(mac.targets.includes('ios-arm64'), 'ios always needs a signature too')
   t.ok(mac.targets.includes('linux-x64'), 'and a mac can cross-link linux just as well')
+
+  // ios is DECLINED, not claimed, even on a Mac executing natively. It used to be treated as a pure
+  // signing gap -- true as far as it goes -- but that made it buildable the instant a darwin
+  // execution tier existed, and nothing here has ever produced an iOS artifact: no `make:ios-*` in
+  // the template, no SDK, no provisioning profile, no simulator runtime. What the seatbelt tier
+  // demonstrated is that codesign produces a runnable arm64 Mach-O EXECUTABLE, which is a different
+  // thing from an app bundle. Same reasoning as android-arm64: declaring beats guessing, and the
+  // costs are asymmetric -- under-promising loses a target nobody has built, over-promising makes a
+  // farm route ios work here and collect a late failure.
+  for (const ios of ['ios-arm64', 'ios-arm64-simulator', 'ios-x64-simulator']) {
+    t.absent(mac.targets.includes(ios), `${ios} is declined until someone verifies iOS packaging`)
+  }
 })
 
 test('the record separates "cannot build" from "cannot sign"', (t) => {
   // The distinction is what routing to a mac peer actually solves, so a farm needs it explicitly.
   const linux = targets.describe({ platform: 'linux', arch: 'x64' })
   t.ok(linux.unsignable.includes('darwin-arm64'))
-  t.ok(linux.unsignable.includes('ios-arm64'))
   t.absent(linux.unsignable.includes('win32-x64'), 'unsigned windows binaries still run')
+
+  // ios is absent from BOTH lists, and that is the point of the distinction rather than a hole in it.
+  // `unsignable` means "a peer that can sign would fix this", so listing an unverified target there
+  // would tell a farm to route it to a Mac -- which is precisely the wrong instruction, because the
+  // gap is packaging we have never exercised, not a signature.
+  t.absent(linux.unsignable.includes('ios-arm64'), 'a mac peer would not fix an unverified target')
+  t.absent(linux.targets.includes('ios-arm64'), 'and it is not offered either')
   t.alike(
     targets.describe({ platform: 'darwin', arch: 'arm64', execPlatform: 'darwin' }).unsignable,
     [],
@@ -156,7 +173,7 @@ test('capability follows where the job EXECUTES, not the host OS', (t) => {
   // unlocks darwin-arm64 -- not the host merely being a Mac.
   const native = targets.describe({ platform: 'darwin', arch: 'arm64', execPlatform: 'darwin' })
   t.ok(native.targets.includes('darwin-arm64'), 'executing on darwin is what makes it buildable')
-  t.ok(native.targets.includes('ios-arm64'))
+  t.absent(native.targets.includes('ios-arm64'), 'but ios stays declined -- see the decline above')
   t.alike(native.unsignable, [], 'and closes the gap entirely')
 })
 

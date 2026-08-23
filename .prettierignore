@@ -15,3 +15,9 @@ etc/seccomp/build-v1.json
 # with JSON.stringify, so a repo-wide prettier pass and the next --capture would reformat it back
 # and forth forever.
 etc/seccomp/base-v1.json
+
+# The canonical Seatbelt rendering, written byte-for-byte by lib/isolation/darwin/sbpl.js. Same
+# reason as the seccomp profile above: prettier does not understand SBPL, and reformatting it would
+# break the drift guard in test/sandbox.js. (It is not the file that runs -- the real profile is
+# generated per job -- but it is the one that gets reviewed.)
+etc/sandbox/build-v1.sb

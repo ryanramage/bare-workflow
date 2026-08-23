@@ -85,6 +85,71 @@ test('naming the machine tier does not unlock darwin-arm64', (t) => {
   )
 })
 
+test('the seatbelt tier ranks BELOW container, and says why', (t) => {
+  // The temptation is to rank a native tier highly because it is the newest and the only one that can
+  // build darwin-arm64. Capability is not isolation strength. Seatbelt is kernel-enforced MAC on the
+  // HOST kernel with no namespaces, no pid isolation, no separate filesystem and no capability model,
+  // so it is genuinely weaker than a hardened container -- and the tier ranking is what a farm uses
+  // to reject weakly-built artifacts, so overstating it is not a cosmetic error.
+  const seatbelt = detect.TIERS.find((x) => x.name === 'seatbelt')
+  const container = detect.TIERS.find((x) => x.name === 'container')
+  t.ok(seatbelt, 'the tier is registered')
+  t.ok(seatbelt.rank < container.rank, 'same-kernel MAC is weaker than a hardened container')
+  t.is(detect.RANK.seatbelt, seatbelt.rank)
+
+  // Still no unconfined host tier. Naming a weaker-than-container tier must not become the precedent
+  // for one -- decision 3 forbids UNCONFINED host execution specifically, not native execution.
+  t.absent(detect.TIERS.some((x) => x.name === 'host' || x.name === 'emulation'))
+})
+
+test('seatbelt is decided without asking podman', (t) => {
+  // It needs no container runtime, so a stopped podman machine must not make it report unavailable.
+  // Putting it inside the podman-failure loop would tell a Mac user their NATIVE tier is broken
+  // because of podman -- false, and unactionable in the specific way this project keeps fixing.
+  const withBadImage = detect
+    .probe({ image: 'localhost/definitely-not-a-real-image:x' })
+    .tiers.find((x) => x.name === 'seatbelt')
+  const plain = detect.probe().tiers.find((x) => x.name === 'seatbelt')
+  t.is(withBadImage.available, plain.available, 'a broken image does not change the verdict')
+  t.is(withBadImage.reason, plain.reason, 'nor the reason')
+
+  // And on a platform it can never work on, it says so as a fact about the platform rather than
+  // offering a fix that cannot be followed.
+  const onLinux = detect.probe({ platform: 'linux' }).tiers.find((x) => x.name === 'seatbelt')
+  t.absent(onLinux.available, 'never available off macOS')
+  t.ok(/macOS-only/.test(onLinux.reason), 'says why: ' + onLinux.reason)
+  t.absent(onLinux.remediation, 'and offers no fix, because there is not one')
+})
+
+test('an available seatbelt tier is what unlocks darwin-arm64 -- and only then', (t) => {
+  // The whole capability model in one assertion. TIER_PLATFORM.seatbelt = 'darwin' is what makes
+  // darwin-arm64 legitimately buildable, but the gate is the PROBE: until the tier reports available,
+  // nothing offers the target. Both halves matter -- the mapping without the gate over-promises, and
+  // the gate without the mapping means a Mac can never build its own platform.
+  const targets = require('../lib/targets.js')
+  t.is(targets.TIER_PLATFORM.seatbelt, 'darwin', 'the tier executes on darwin')
+  t.ok(
+    targets
+      .describe({ tiers: ['seatbelt'], platform: 'darwin', arch: 'arm64' })
+      .targets.includes('darwin-arm64'),
+    'so a job on it can build darwin-arm64'
+  )
+
+  // What doctor and validate actually report: derived from AVAILABLE tiers only.
+  const probe = detect.probe()
+  const available = probe.tiers.filter((x) => x.available).map((x) => x.name)
+  const caps = targets.describe({ tiers: available })
+  const seatbelt = probe.tiers.find((x) => x.name === 'seatbelt')
+  if (seatbelt.available) {
+    t.ok(caps.targets.includes('darwin-arm64'), 'available here, so the target is offered')
+  } else {
+    t.absent(
+      caps.targets.includes('darwin-arm64'),
+      `unavailable here (${seatbelt.reason}), so the target is NOT offered`
+    )
+  }
+})
+
 test('an unknown minimum tier is rejected', (t) => {
   t.exception(() => detect.resolve({ min: 'emulation' }), /UNKNOWN_TIER/)
   t.exception(() => detect.resolve({ min: 'whatever' }), /UNKNOWN_TIER/)

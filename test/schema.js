@@ -20,6 +20,42 @@ function rejects(t, src, pattern, why) {
   }
 }
 
+test('the tier vocabulary is one list, not three that drift', (t) => {
+  // Three modules need to know the tier names: the registry in detect.js (which owns the ranks), the
+  // argv builder, and the schema. They were three separate literals, and it went wrong exactly as you
+  // would expect -- the `machine` tier was added to the registry and to argv but not to the schema, so
+  // `--tier machine` worked on the command line while a workflow declaring `tier: machine` was
+  // rejected as unknown. Decision 8 makes that more than a papercut: the declared tier is part of the
+  // contract `plan --json` is supposed to show in full, so a Mac user could not state the boundary
+  // their build required.
+  //
+  // The schema now derives its list. This asserts argv has not drifted from the registry either.
+  const detect = require('../lib/isolation/detect.js')
+  const argv = require('../lib/isolation/podman/argv.js')
+  const schema = require('../lib/schema')
+
+  const registry = detect.TIERS.map((x) => x.name)
+
+  // The schema must know EVERY registered tier -- anything less and a tier is selectable with --tier
+  // but not declarable in a workflow, which is the `machine` bug described above.
+  t.alike([...schema.TIERS].sort(), [...registry].sort(), 'schema knows every registered tier')
+
+  // argv is a SUBSET, and deliberately so: it builds podman command lines, and `seatbelt` is not a
+  // podman tier at all -- it is a native Seatbelt process with its own launcher. What must hold is
+  // that argv never names a tier the registry does not, which would be a tier nothing can select.
+  for (const tier of argv.TIERS) {
+    t.ok(registry.includes(tier), `argv's ${tier} is a registered tier`)
+  }
+
+  // And the vocabulary is actually usable end to end, which is the thing that was broken.
+  for (const tier of registry) {
+    t.execution(
+      () => ok(`version: 1\ntier: ${tier}\nsteps:\n  - echo ok\n`),
+      `a workflow can declare tier: ${tier}`
+    )
+  }
+})
+
 test('the minimal workflow parses', (t) => {
   const w = ok('version: 1\nsteps:\n  - echo hi\n')
   t.is(w.version, SCHEMA_VERSION)

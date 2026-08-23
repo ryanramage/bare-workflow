@@ -553,6 +553,59 @@ What remains:
    is the remaining half.
 5. **Then the actual goal:** a darwin execution tier, so `darwin-arm64` can be built. See below.
 
+##### Progress: the prerequisite and the tier registration are done
+
+`strayFds()` has a real darwin backend, and the `seatbelt` tier is registered at **rank 40** — below
+`container` (50), because same-kernel MAC with no namespaces, no pid isolation and no capability model
+is genuinely weaker than a hardened container, and the rank is what a farm uses to reject
+weakly-built artifacts.
+
+Three things that were not obvious until the code was written:
+
+- **`/dev/fd` is not a drop-in for `/proc/self/fd`.** It lists descriptor numbers but does not resolve
+  paths — `readlink` returns nothing and `realpath` leaks only the basename (`/dev/fd/hosts`). The
+  backend is `lsof -p <pid> -F ftn` as the primary source, with a `/dev/fd` + `fstat` type-only
+  fallback that reports a **degraded** status rather than `ok`, so an isolated tier refuses rather
+  than accepting a weaker scan. Proven falsifiable: a descriptor passed as an extra `stdio` entry is
+  caught as `3:/private/etc/hosts`, and the control run is clean.
+- **The obvious reading of lsof's types is wrong.** Treating type `unix` as always-reportable — which
+  looks right, since a NAMED socket always is — flagged Bare's own runtime sockets on every startup,
+  and `lib/sandbox.js` refuses any non-empty `strayFds`, so every run would have failed to start.
+  Linux spells the same anonymous objects `socket:[N]`/`pipe:[N]`; macOS lsof spells them
+  `->0x<pointer>`. Bare also holds `DIR /` handles in every process.
+- **The agent has no PATH**, so `which('lsof')` failed and the scan silently degraded exactly where it
+  mattered. Fixed the way this file already solves it for the shell: known absolute locations.
+
+**The ordering advice in the earlier plan was backwards, and this is the correction.**
+`executionPlatform()` falls back to the HOST platform for any tier name it does not recognise, so
+registering `seatbelt` in `detect.js` _without_ `TIER_PLATFORM.seatbelt` already claims `darwin-arm64`
+— and all three ios targets — while nothing can execute it. The name and the mapping must land
+together; what gates the capability is the **probe**, which reports the tier unavailable until the
+Seatbelt profile exists.
+
+Two live bugs surfaced while wiring it:
+
+- **The empty-tier fallback regressed the moment a second platform entered the registry.**
+  `executionPlatform([])` returned "the platform all tiers share" — which silently became "the host"
+  once `TIER_PLATFORM` held both `linux` and `darwin`, so an unconfigured Mac went straight back to
+  claiming `darwin-arm64`. That is the exact regression recorded under "Fixed while preparing",
+  reintroduced by adding a tier rather than by touching the function. It now answers with the
+  **least capable** platform: promise the smallest set until you know what you have.
+- **A dormant over-claim woke up.** `SIGNING_HOST` treated the three ios targets as a pure signing
+  gap, so a natively-executing Mac reported them buildable. Nothing here has ever produced an iOS
+  artifact — no `make:ios-*` in the template, no SDK, no provisioning profile — and what the seatbelt
+  work demonstrated is that `codesign` produces a runnable arm64 Mach-O **executable**, which is not
+  an app bundle. They are now in `UNVERIFIED` alongside `android-arm64`, which is a **hard** decline on
+  every platform (it previously fell back to "buildable natively", indistinguishable for android since
+  it is native to nothing here). They are excluded from `unsignable` too: routing them to a Mac peer
+  would not fix packaging nobody has exercised, which is the whole point of that field.
+
+Also fixed: the `machine` tier shipped with its own copy of the tier list missing from
+`lib/schema/index.js`, so `--tier machine` worked while `tier: machine` in a workflow was rejected as
+unknown — breaking decision 8's "the declared tier is part of the contract". The schema now derives
+from `detect.TIERS`; `test/schema.js` asserts the schema knows every registered tier and that argv
+(podman-only, so `seatbelt` is correctly absent) never names one the registry does not.
+
 #### The darwin execution tier: three options, and a decision you need to make
 
 There is **no container option** for `darwin-arm64`. The choices:
@@ -624,6 +677,159 @@ Bazel both ship on it, and the deprecation has outlived several macOS majors.
    _report_ that honestly rather than silently returning `[]` — but "honestly unsupported" is fine for
    a test-only local launcher and not fine for a real tier. A native tier whose fd-leak detector
    cannot run is a security control that does not exist. This is a prerequisite, not a follow-up.
+
+##### Progress: the profile works, and what it cost to find out
+
+A full `darwin-arm64` build now runs inside a `(deny default)` Seatbelt profile and produces a
+`Mach-O arm64`, `Signature=adhoc` binary **that executes** — while the same profile refuses
+`~/.ssh/id_ed25519`, `~/.npmrc`, listing `/Users`, network, and any write outside the workspace.
+Both halves verified, because a profile permissive enough to build is not a boundary.
+
+Four rules were needed that nothing in the documentation suggests, each found by a build failing in a
+way that named neither the sandbox nor the missing rule:
+
+| Rule                               | Symptom without it                                                                   |
+| ---------------------------------- | ------------------------------------------------------------------------------------ |
+| `(allow file-read* (literal "/"))` | **SIGABRT, no output at all** — not even `/usr/bin/true` runs. dyld cannot resolve   |
+| `(allow sysctl-read)`              | every **Rust** binary panics: `failed to set up alternative stack guard page`        |
+| `file-read-metadata` on ancestors  | `EPERM lstat '/Users'`, then `'/private'` — a subpath grant does not imply traversal |
+| the same on `/etc`, `/tmp`, `/var` | `EPERM lstat '/var'` — macOS aliases them into /private and processes walk the LINK  |
+
+The sysctl one is the least guessable and the most instructive: `npm` on this machine is a **Volta**
+shim, which is written in Rust, so the entire toolchain fell over with a message that never mentions
+the sandbox. `TMPDIR` must also point inside the workspace, or the build reaches for the host's
+per-user temp under `/private/var/folders` and is denied.
+
+`(literal "/")` versus `(subpath "/")` is the single most dangerous one-character difference in the
+file: the first grants the root directory entry that dyld needs, the second grants the whole
+filesystem, and in a diff they look almost identical. There is a test for exactly that.
+
+Also note `(deny default (with report))` does not exist — sandbox-exec rejects the modifier on a deny
+action and then refuses to load the profile at all.
+
+**The profile cannot be a single static artifact**, unlike the seccomp one: it names the job's
+workspace and the host's toolchain paths. So the committed `etc/sandbox/build-v1.sb` is a **canonical
+rendering** against fixed inputs, existing to be reviewed and drift-guarded; the profile that actually
+runs is generated per job and _its_ sha256 is what belongs in the attestation. That distinction is
+written at the top of `scripts/build/sandbox.js`, because treating the committed file as the enforced
+one would be a natural and wrong assumption.
+
+##### Rank and capability are orthogonal — `--tier` was a floor, not a selector
+
+The tier that can build `darwin-arm64` is the **weakest** one here. That combination had never
+occurred before, and it exposed a live bug: `--tier X` resolves to "the strongest available tier at or
+above X", so `--tier seatbelt` ran on `machine` — and `--tier container` on a Linux box has always
+silently run on `microvm`. Harmless while rank and capability agreed, and precisely wrong now, since
+`machine` cannot produce a darwin binary. `bin.js:257` already described the flag as "an explicit
+override for someone who accepts the risk", which is not what it did.
+
+Resolution is now **capability-aware**: among available tiers at or above the minimum, prefer the
+strongest that can build everything the run declared, falling back to the strongest available so a run
+declaring nothing behaves exactly as before. A linux-only run still picks `machine`; a run wanting
+`darwin-arm64` picks `seatbelt`.
+
+**Known limitation, stated rather than discovered later:** this is per-RUN, not per-task. A workflow
+mixing `darwin-arm64` with linux targets picks `seatbelt` for all of them, so the linux builds get a
+weaker tier than they need. Per-task resolution is the right end state and is the same shape as the
+farm's routing decision, which is why it was not bodged in here.
+
+##### The launcher: done, and `darwin-arm64` now builds through the runner
+
+`bare bin.js run <wf> --tier seatbelt` produces a `darwin-arm64` distributable end to end:
+`Mach-O 64-bit executable arm64`, `Signature=adhoc`, **and it runs**. The same run's steps cannot read
+`~/.ssh/id_ed25519`, cannot list `/Users`, cannot write to `$HOME` and have no network. The tier joins
+the lifecycle suite alongside `local` and `container` — 52/52 there, 325/325 overall.
+
+What the launcher is: `sandbox-exec -f <per-job profile> <bare> lib/agent/bin.js`, stdio on 0/1/2,
+speaking the same protocol as every other tier. It is NOT a port of the podman launcher — no image, no
+argv builder, no container to reap — but it implements the same `{ stream, attestation, close }`
+handle, which is why the transport, framing and tar transfer needed no changes.
+
+Five things that only surfaced by running it:
+
+- **`bin.js`, not `index.js`.** The standalone entry is the one that calls `ensureWorkspace` before
+  serving. Pointing at `index.js` gives a working handshake and then every step fails with "working
+  directory does not exist: `<workspace>/src`", which reads as a workspace bug. `local-launcher.js`
+  gets away with `index.js` only because its descriptor overrides `cwd`.
+- **Seatbelt matches RESOLVED paths.** `os.tmpdir()` returns `/var/folders/...` which resolves to
+  `/private/var/folders/...`, so a profile granting the unresolved form matches nothing. The agent
+  started and died on `os.cwd()` — "operation not permitted" — inside its own granted workspace.
+- **`/dev/null` must be WRITABLE.** It was in the read-only list, and every shell wrapper that
+  redirects to it printed `npm: line 2: /dev/null: Operation not permitted`.
+- **PATH order is not grant order.** The toolchain list is sorted so the generated profile stays
+  diffable — and sorting it for PATH put a stale `~/.nvm/.../v18.13.0/bin` ahead of Volta, running the
+  build under node 18, which CLAUDE.md already records as silently failing exactly this target. The
+  two are now separate views of the same set: sorted for the profile, caller order for PATH.
+- **`BW_WORKSPACE` is exported to steps**, so a workflow can be written once and run on any tier
+  rather than hardcoding `/w/cache`.
+
+##### Version-manager shims do not work inside the sandbox, and must not be made to
+
+The sharpest finding. `npm` on this machine is a **Volta** shim: `~/.volta/bin/bare-build` is a symlink
+to `volta-shim`, which resolves the real binary by consulting mutable state and taking a lock. Inside
+the sandbox it fails with
+
+```
+Volta error: Could not find executable "bare-build"
+Volta error: Error cause: Resource temporarily unavailable (os error 35)
+```
+
+because it cannot write `~/.volta/volta.lock`. The obvious fix — grant the sandbox write access to
+`~/.volta` — is exactly the wrong trade: a build could then replace a binary that later runs
+**unsandboxed**, in a tier whose entire premise is that `$HOME` is unreachable. So the shim is resolved
+**on the host, before the sandbox exists** (`volta which <tool>`), and the sandbox is given the real
+directories instead. nvm, asdf and rbenv have the same shape and will need the same treatment.
+
+##### Also fixed while wiring it
+
+- **The attestation was recording a lie.** `bin.js` assembled the isolation block by hand from the
+  container image and the seccomp path — fine while every tier was podman, and false the moment one
+  was not: a seatbelt job recorded an image and a seccomp profile it never used, while the SBPL
+  profile that WAS the boundary appeared nowhere. It now comes from `launcher.attestation`, so each
+  launcher reports its own posture, plus a `sandbox` block (path, sha256, workspace, granted
+  toolchain) and `limits`/`limitsUnenforceable`.
+- **The driver no longer hardcodes `/w`.** `Sandbox` takes its workspace and an env floor from the
+  launcher handle, so `/w/src`, `/w/home`, `TMPDIR` and the cache destination follow the tier.
+- **Two lifecycle assertions were container-shaped.** The uid check now skips for a tier that maps no
+  uid (macOS has no user namespaces, and `bare-os` has no `getuid()` to compare against) rather than
+  inventing a value; the network check uses `/proc/net/route` on Linux and an actual connect attempt
+  on darwin — verified falsifiable, since unconfined it reports egress.
+
+##### The escape suite, and its negative control
+
+`test/escape/darwin.js`. Every hardened probe runs twice: once under the real generated profile and
+once under a deliberately weakened `(allow default)` one. The weakened run **leaks every single one**
+— the canary, `~/.ssh/id_ed25519`, `~/.npmrc`, the home listing, `/Users`, the login keychain, `/tmp`
+and the network — so each "denied" in the hardened run is a measurement rather than a tautology. Two
+probes in this project have already been vacuous in exactly that way (`ip route`, and a podman socket
+path built from a hardcoded uid), which is why this is the first thing to check.
+
+Two things about it worth keeping:
+
+- **It probes the profile that ships**, not a tighter hand-written one. The first version tested
+  `toolchain: []`, which no real job ever gets — the launcher grants read on the host's PATH
+  directories, Volta, Homebrew and the Xcode developer dir (43 paths on this machine). Proving a
+  profile nobody runs is tight says nothing about the one that does, so `seatbeltToolchain()` moved
+  into `lib/isolation/darwin/toolchain.js` and both `bin.js` and the suite call it.
+- **The toolchain grants are asserted directly**, as well as through the probes: no entry may be
+  `$HOME`, or a parent of `~/.ssh`, `~/.npmrc`, `~/.aws`, `~/Library/Keychains` or `~/.gnupg`. That
+  list is the one soft edge of an otherwise deny-by-default boundary, and a single careless entry
+  would open everything the rest of the suite proves closed without changing the profile's shape at
+  all.
+
+Where a probe cannot be verified on a given host — no `~/.ssh` key, no network — the control reports
+**UNVERIFIED in this run** rather than passing quietly.
+
+##### What is still open on this tier
+
+- **Per-task tier resolution.** Resolution is per RUN, so a workflow mixing `darwin-arm64` with linux
+  targets puts all of them on seatbelt — the linux builds get a weaker tier than they need.
+- **The toolchain is granted wholesale from PATH.** Narrow in that `$HOME` is not granted and the
+  secret-adjacency assertion above holds; broad in that whatever is on your PATH becomes readable.
+  The attestation records exactly which paths, which is a mitigation rather than a fix.
+- **No darwin agent binary.** The agent runs from source under the host `bare`, so the repo is on the
+  granted read list. A `bare-build --standalone` darwin agent would remove that.
+- **Version managers other than Volta** are unhandled — see `resolveShims()`.
 
 ##### The decision-3 tension, restated now that the facts are in
 
@@ -821,6 +1027,13 @@ Things that have gone wrong in this project's own development, worth avoiding:
   override that supersedes it, so the test passed on a Mac (where `can.tier` IS `container`) and
   failed on Linux (where it is `microvm`). A blanket fix applied to a test suite deserves a check for
   the one test whose subject is the thing being blanket-fixed.
+- **`test/store.js` leaks a file descriptor**, found by the new darwin fd scan reporting
+  `/tmp/bw-store-…/r/app` in the shared test process. `localStore({root, runId}).put(...)` constructs
+  a `Localdrive` internally and `Store` exposes no `close()`, so the handle is never released. Linux
+  never noticed because its `ALLOWED_FD_PATHS` includes `/tmp/` — correct there, since a container's
+  `/tmp` is inside the sandbox, and deliberately NOT mirrored in the darwin allowlist where `/tmp` is
+  the host's. Fixing it properly means giving `Store` a close, which is an API change; left as a known
+  finding rather than widened into this work.
 - **The hello-pear publish job flakes under full-suite load.** Observed twice on macOS: the run exits
   1 with no `publish/done` event, while the same test passes in isolation. Not diagnosed — the likely
   candidate is pear-ci's 120 s deadline (`DEFAULT_TIMEOUT_MS`), which is a wall-clock race against a

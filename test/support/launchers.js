@@ -69,6 +69,31 @@ function available() {
   // client whose machine is stopped on Linux and fails opaquely everywhere else; on macOS a stopped
   // machine is the normal state of a correct install, so "podman unavailable" was the single most
   // misleading string in the suite.
+  // The native darwin tier, if this machine can run it. Probed independently of podman -- it needs
+  // no container runtime at all, so it must not sit behind the early returns below.
+  const darwin = require('../../lib/isolation/darwin/probe.js')
+  const sandboxProfile = path.resolve('etc/sandbox/build-v1.sb')
+  const seatbelt = darwin.probe({ profile: sandboxProfile })
+  if (seatbelt.available) {
+    const { create: seatbeltLauncher } = require('../../lib/isolation/darwin/launcher.js')
+    let sn = 0
+    out.push({
+      name: 'seatbelt',
+      isolated: true,
+      expectPlatform: 'darwin',
+      // No expectUid. This tier deliberately cannot state one: there are no user namespaces on
+      // macOS, so a step runs as the developer, and `bare-os` has no getuid() to compare against
+      // anyway. limits.js records that as unenforceable rather than pretending a uid was mapped.
+      // The suite skips the assertion rather than inventing a value to match.
+      make: () =>
+        seatbeltLauncher({
+          jobId: `bwlife-s${sn++}`,
+          tier: 'seatbelt',
+          toolchain: [path.resolve('.'), path.dirname(Bare.argv[0])]
+        })
+    })
+  }
+
   const v = sh('podman', ['info', '--format', '{{.Version.Version}}'])
   if (v.code !== 0) {
     cached = {

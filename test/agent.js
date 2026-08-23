@@ -45,7 +45,11 @@ test('the fd scan says whether it could run, not just what it found', (t) => {
   // measuring nothing -- and so did the assertion below whose entire job is to catch a leak.
   const scan = agent.scanFds()
   t.ok(typeof scan.status === 'string' && scan.status.length > 0, 'status: ' + scan.status)
-  t.alike(scan.fds, [], 'a clean process reports no strays')
+  // Not asserted as empty -- see the delta note below. This process is shared with every other test
+  // file, and by the time this runs an earlier one has legitimately left descriptors open. (The scan
+  // reporting them is the detector working, not failing: test/store.js leaves one on a /tmp drive
+  // path, which is a real fd leak in that test.)
+  t.ok(Array.isArray(scan.fds), 'reports a list of findings, whatever this process already holds')
 
   if (scan.status !== agent.FD_SCAN_OK) {
     // Deliberately not a pass dressed up as a skip: state which platform, and that the detector is
@@ -65,15 +69,55 @@ test('the fd scan says whether it could run, not just what it found', (t) => {
   const host = ['/etc/hostname', '/etc/hosts', '/etc/passwd'].find((f) => fs.existsSync(f))
   t.ok(host, 'found a host file to open: ' + host)
 
+  // Asserted as a DELTA, not against an empty baseline.
+  //
+  // This test runs inside the shared brittle process as test ~180 of ~290, and by then earlier files
+  // have left descriptors open -- test/store.js leaves one on a /tmp drive path, which the darwin
+  // scan correctly reports. Asserting "exactly one stray" only held when this file ran alone, so it
+  // passed in isolation and failed in the suite. What the detector actually promises is that opening
+  // a host handle ADDS a finding, and closing it removes it again.
+  //
+  // Compared against the RESOLVED path: on macOS `/etc` is a symlink to `/private/etc` and lsof
+  // reports what the descriptor points at, so asserting the path we opened would fail on a platform
+  // difference rather than on anything being wrong.
+  const resolved = fs.realpathSync(host)
+  const before = agent.strayFds()
   const fd = fs.openSync(host, 'r')
   try {
-    const stray = agent.strayFds()
-    t.is(stray.length, 1, 'an inherited host-file handle is caught')
-    t.ok(stray[0].endsWith(':' + host), 'and named: ' + stray[0])
+    const during = agent.strayFds()
+    const added = during.filter((x) => !before.includes(x))
+    t.is(added.length, 1, `opening a host file adds exactly one finding: ${added.join(', ')}`)
+    t.ok(added[0] && added[0].endsWith(':' + resolved), `named ${resolved}: ` + added[0])
   } finally {
     fs.closeSync(fd)
   }
-  t.alike(agent.strayFds(), [], 'and it clears when closed')
+  t.alike(agent.strayFds(), before, 'and it clears when closed')
+})
+
+test("the fd scan does not fire on the runtime's own plumbing", (t) => {
+  // The other half of the detector, and the one that decides whether it survives contact with
+  // reality. A control that fires on every startup gets switched off, and `lib/sandbox.js` REFUSES a
+  // sandbox whose agent reports any stray -- so a false positive here does not just add noise, it
+  // makes every run fail to start.
+  //
+  // This bit for real while writing the darwin backend. Bare holds open pipes, kqueues, unix sockets
+  // and directory handles on `/` in every process; lsof names the anonymous ones `->0x<pointer>`,
+  // which is the same thing procfs spells `socket:[N]` and `pipe:[N]`. Treating lsof's `unix` type as
+  // always-reportable -- the obvious reading, since a named socket IS always a finding -- flagged
+  // Bare's own sockets on every single startup.
+  const scan = agent.scanFds()
+  if (scan.status !== agent.FD_SCAN_OK) {
+    t.comment(`fd scanning unavailable here: ${scan.status}`)
+    return t.pass('skipped')
+  }
+
+  // Not "the list is empty" -- this shares a process with every other test file, so it legitimately
+  // is not. The property is narrower and is the one that matters: whatever IS reported, none of it is
+  // the runtime's own plumbing.
+  const anon = scan.fds.filter((x) => /->0x[0-9a-f]+|count=/.test(x))
+  t.alike(anon, [], 'anonymous kernel objects are never reported: ' + JSON.stringify(anon))
+  const rootDirs = scan.fds.filter((x) => /^\d+:\/$/.test(x))
+  t.alike(rootDirs, [], "Bare's root directory handles are never reported")
 })
 
 test('ensureWorkspace creates the subtree it is given', (t) => {

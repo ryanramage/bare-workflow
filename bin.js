@@ -10,6 +10,7 @@
 const fs = require('bare-fs')
 const path = require('bare-path')
 const { hostEnv } = require('./lib/host-env.js')
+const env = require('bare-env')
 const { command, flag, arg, summary, description, header, footer } = require('paparam')
 
 const schema = require('./lib/schema')
@@ -17,6 +18,8 @@ const targets = require('./lib/targets.js')
 const graph = require('./lib/graph.js')
 const detect = require('./lib/isolation/detect.js')
 const arch = require('./lib/isolation/arch.js')
+const { create: createSeatbeltLauncher } = require('./lib/isolation/darwin/launcher.js')
+const { seatbeltToolchain } = require('./lib/isolation/darwin/toolchain.js')
 const argvlib = require('./lib/isolation/podman/argv.js')
 const { create: createLauncher } = require('./lib/isolation/podman/launcher.js')
 const { create: createTaskRun } = require('./lib/run')
@@ -99,6 +102,13 @@ function serverArch() {
   if (r.status !== 0) return null
   return (r.stdout ? r.stdout.toString() : '').trim() || null
 }
+
+// The read-only host paths the seatbelt tier grants a build.
+//
+// A container tier gets its toolchain from an image; a native one has to be told where the host keeps
+// node, npm, bare-build and the Xcode tools. Kept explicit and narrow rather than granting `$HOME`:
+// these end up in the attestation precisely because they are the part of the boundary that varies by
+// machine, and `~/.volta` is a toolchain while `~/.ssh` is not.
 
 // --- validate --------------------------------------------------------------------------
 
@@ -267,7 +277,11 @@ const run = command(
 
     let resolved
     try {
-      resolved = detect.resolve({ min: minTier })
+      // The tasks are already expanded, so the tier can be chosen knowing what the run must
+      // BUILD, not just how strong a boundary is available. Without this, asking for darwin-arm64
+      // on a Mac picks `machine` -- stronger, and unable to produce it -- and the target is quietly
+      // skipped as unsupported. See detect.resolve for the per-run caveat.
+      resolved = detect.resolve({ min: minTier, targets: [...new Set(tasks.map((t) => t.target))] })
     } catch (err) {
       if (asJson) {
         line(JSON.stringify({ cmd: 'error', code: err.code, error: err.message }))
@@ -544,14 +558,28 @@ const run = command(
           return { status: 'skipped', reason: 'target not buildable on this host' }
         }
 
+        // Tier dispatch. The two families are genuinely different -- one builds a podman command
+        // line around an image, the other confines a native process with a Seatbelt profile -- so
+        // this is a branch rather than a shared spec with optional fields.
+        const jobId =
+          `${task.id.replace(/[^a-z0-9-]/gi, '-')}-${Date.now().toString(36)}`.toLowerCase()
         const chosen = imageFor.get(task.job)
-        const launcher = createLauncher({
-          jobId: `${task.id.replace(/[^a-z0-9-]/gi, '-')}-${Date.now().toString(36)}`.toLowerCase(),
-          tier: resolved.tier,
-          image: { ref: chosen.image.split(':')[0], digest: digests.get(chosen.image) },
-          seccompProfile: SECCOMP,
-          scope: false
-        })
+        const launcher =
+          resolved.tier === 'seatbelt'
+            ? createSeatbeltLauncher({
+                jobId,
+                tier: resolved.tier,
+                // What the build is allowed to READ. Everything else on this machine is denied, so
+                // these are recorded in the attestation: they are the boundary's one soft edge.
+                toolchain: seatbeltToolchain()
+              })
+            : createLauncher({
+                jobId,
+                tier: resolved.tier,
+                image: { ref: chosen.image.split(':')[0], digest: digests.get(chosen.image) },
+                seccompProfile: SECCOMP,
+                scope: false
+              })
 
         const taskRun = createTaskRun({
           task,
@@ -587,13 +615,15 @@ const run = command(
           task,
           job,
           result,
+          // Taken from the LAUNCHER, not assembled here. This block used to hardcode the image and
+          // the seccomp path, which was fine while every tier was podman -- and became a lie the
+          // moment one was not: a seatbelt job recorded a container image and a seccomp profile it
+          // never used, while the SBPL profile that was actually the boundary appeared nowhere. Each
+          // launcher already reports its own posture correctly; the only thing added here is what
+          // the launcher cannot know.
           isolation: {
-            tier: resolved.tier,
+            ...launcher.attestation,
             shared: resolved.shared,
-            image: `${chosen.image.split(':')[0]}@${digests.get(chosen.image)}`,
-            seccompProfile: SECCOMP,
-            program: launcher.built.program,
-            argv: launcher.built.argv,
             agent: result.agent || null
           },
           source: sourceFacts,

@@ -121,7 +121,10 @@ function lifecycleSuite(test, descriptor) {
       await run.wait()
       const { out } = read()
       t.ok(out.includes('MINE=yes'), 'declared env arrives')
-      t.ok(out.includes('HOME=/w/home'), 'BASE_ENV floor applied')
+      // Derived from the sandbox's workspace, not the literal `/w`: a native tier's workspace is a
+      // per-job scratch directory on the host, so pinning the string here would assert a container
+      // detail rather than the property, which is that the env floor is applied at all.
+      t.ok(out.includes(`HOME=${box.workspace}/home`), 'base env floor applied')
       t.ok(out.includes('USER=[]'), 'undeclared host vars absent')
     })
   })
@@ -240,16 +243,21 @@ function lifecycleSuite(test, descriptor) {
       // The agent creates /w/{src,home,artifacts} at startup, because the workspace tmpfs arrives
       // empty regardless of what the image built.
       await withBox({}, async (box) => {
+        // Built from box.workspace, not the literal `/w`. Every container tier answers `/w`, but a
+        // native tier's workspace is a per-job scratch directory on the host -- pinning the string
+        // would assert a container detail rather than the property, which is that the agent creates
+        // its subtree wherever the launcher put it.
+        const w = box.workspace
         const run = box.exec(
           step(
-            'pwd; touch /w/src/probe && echo writable; test -d /w/home && echo home-ok; test -d /w/artifacts && echo artifacts-ok'
+            `pwd; touch ${w}/src/probe && echo writable; test -d ${w}/home && echo home-ok; test -d ${w}/artifacts && echo artifacts-ok`
           )
         )
         const read = collect(run)
         const res = await run.wait()
         const { out } = read()
         t.is(res.code, 0, 'workspace usable\n' + read().err)
-        t.ok(out.includes('/w/src'), 'default cwd is the workspace')
+        t.ok(out.includes(w + '/src'), 'default cwd is the workspace')
         t.ok(out.includes('writable'))
         t.ok(out.includes('home-ok'))
         t.ok(out.includes('artifacts-ok'))
@@ -257,6 +265,15 @@ function lifecycleSuite(test, descriptor) {
     })
 
     test(tag('the step runs at the expected uid'), async (t) => {
+      // Not every isolated tier maps a uid. The container tiers do (1000, or 0 under krun where the
+      // VM is the boundary); the native seatbelt tier cannot, because macOS has no user namespaces
+      // -- a step runs as the developer, and that is recorded as an unenforceable limit rather than
+      // dressed up as isolation. A descriptor with no expectUid says so instead of asserting a value
+      // invented to make the test pass.
+      if (!descriptor.expectUid) {
+        t.comment(`the ${name} tier does not map a uid -- there is nothing to assert`)
+        return t.pass('skipped')
+      }
       await withBox({}, async (box) => {
         const run = box.exec(step('id -u'))
         const read = collect(run)
@@ -279,11 +296,13 @@ function lifecycleSuite(test, descriptor) {
 
       try {
         await withBox({}, async (box) => {
-          const put = await box.put(src, '/w/src/incoming')
+          const put = await box.put(src, box.workspace + '/src/incoming')
           t.is(put.files, 2, 'both files arrived')
 
           const check = box.exec(
-            step('cat /w/src/incoming/a.txt; wc -c < /w/src/incoming/nested/b.bin')
+            step(
+              `cat ${box.workspace}/src/incoming/a.txt; wc -c < ${box.workspace}/src/incoming/nested/b.bin`
+            )
           )
           const read = collect(check)
           const res = await check.wait()
@@ -292,12 +311,14 @@ function lifecycleSuite(test, descriptor) {
           t.ok(read().out.includes('4'), 'binary length intact')
 
           const produce = box.exec(
-            step('mkdir -p /w/artifacts/out && echo made-inside > /w/artifacts/out/result.txt')
+            step(
+              `mkdir -p ${box.workspace}/artifacts/out && echo made-inside > ${box.workspace}/artifacts/out/result.txt`
+            )
           )
           produce.stdout.on('data', () => {})
           t.is((await produce.wait()).code, 0, 'produced an artifact')
 
-          const got = await box.get('/w/artifacts/out', out)
+          const got = await box.get(`${box.workspace}/artifacts/out`, out)
           t.is(got.files, 1, 'one file came back')
           t.is(
             fs.readFileSync(out + '/result.txt', 'utf8').trim(),
@@ -330,12 +351,12 @@ function lifecycleSuite(test, descriptor) {
 
       try {
         await withBox({}, async (box) => {
-          await box.put(src, '/w/src/bin')
+          await box.put(src, `${box.workspace}/src/bin`)
 
           // Asserted from inside with `test -x`, not by reading a mode we wrote ourselves.
           const check = box.exec(
             step(
-              'test -x /w/src/bin/tool && echo TOOL-EXEC; test -x /w/src/bin/data || echo DATA-PLAIN; /w/src/bin/tool'
+              `test -x ${box.workspace}/src/bin/tool && echo TOOL-EXEC; test -x ${box.workspace}/src/bin/data || echo DATA-PLAIN; ${box.workspace}/src/bin/tool`
             )
           )
           const read = collect(check)
@@ -347,13 +368,13 @@ function lifecycleSuite(test, descriptor) {
 
           const produce = box.exec(
             step(
-              'mkdir -p /w/artifacts/b && printf "#!/bin/sh\\n" > /w/artifacts/b/made && chmod +x /w/artifacts/b/made && echo plain > /w/artifacts/b/notes'
+              `mkdir -p ${box.workspace}/artifacts/b && printf "#!/bin/sh\\n" > ${box.workspace}/artifacts/b/made && chmod +x ${box.workspace}/artifacts/b/made && echo plain > ${box.workspace}/artifacts/b/notes`
             )
           )
           produce.stdout.on('data', () => {})
           t.is((await produce.wait()).code, 0, 'produced an executable inside')
 
-          await box.get('/w/artifacts/b', out)
+          await box.get(`${box.workspace}/artifacts/b`, out)
           t.ok(fs.statSync(out + '/made').mode & 0o100, 'and it is still executable on the host')
           t.absent(fs.statSync(out + '/notes').mode & 0o111, 'while a plain file stays plain')
         })
@@ -375,13 +396,13 @@ function lifecycleSuite(test, descriptor) {
         await withBox({}, async (box) => {
           const setup = box.exec(
             step(
-              'mkdir -p /w/artifacts/x && echo real > /w/artifacts/x/real.txt && ln -s /etc/hostname /w/artifacts/x/leak'
+              `mkdir -p ${box.workspace}/artifacts/x && echo real > ${box.workspace}/artifacts/x/real.txt && ln -s /etc/hostname ${box.workspace}/artifacts/x/leak`
             )
           )
           setup.stdout.on('data', () => {})
           t.is((await setup.wait()).code, 0)
 
-          const got = await box.get('/w/artifacts/x', out)
+          const got = await box.get(`${box.workspace}/artifacts/x`, out)
           t.is(got.files, 1, 'only the real file was packed')
           t.alike(fs.readdirSync(out), ['real.txt'], 'the symlink did not come out')
         })
@@ -396,14 +417,28 @@ function lifecycleSuite(test, descriptor) {
       // Cheap end-to-end confirmation that the posture the escape suite proves is the same posture
       // a step actually runs under -- not a separately-configured container.
       await withBox({}, async (box) => {
+        // Two probes, because the Linux one cannot run on darwin and skipping would leave the
+        // strongest claim this suite makes untested on the tier that needs it most.
+        //
+        // Linux: count default routes in /proc/net/route -- kernel-provided, always present. NOT
+        // `ip route`, which is absent from ubuntu:24.04 and made an earlier version of this pass
+        // vacuously in BOTH postures until the negative control caught it.
+        //
+        // darwin: there is no /proc, and a native step shares the host's routing table, so counting
+        // routes would report the developer's own network and fail. What the Seatbelt profile
+        // actually denies is the socket, so the probe is to ATTEMPT a connection and require it to
+        // fail. That is a stronger check than the Linux one, not a weaker substitute.
+        const linux = box.hello.platform === 'linux'
         const run = box.exec(
           step(
-            'awk \'NR>1 && $2=="00000000" {n++} END {print "defaultroutes=" n+0}\' /proc/net/route'
+            linux
+              ? 'awk \'NR>1 && $2=="00000000" {n++} END {print "egress=" n+0}\' /proc/net/route'
+              : 'if exec 3<>/dev/tcp/1.1.1.1/443 2>/dev/null; then echo egress=1; else echo egress=0; fi'
           )
         )
         const read = collect(run)
         await run.wait()
-        t.is(read().out.trim(), 'defaultroutes=0', 'no egress path from a step')
+        t.is(read().out.trim(), 'egress=0', `no egress path from a step (${box.hello.platform})`)
       })
     })
   }
